@@ -3,7 +3,7 @@
 This file tracks which chapters of **Long-Running Agent Systems** have been published.
 
 **Total chapters:** 30
-**Publication schedule:** Every 4 hours, starting after repo creation.
+**Publication schedule:** Every 20 minutes, until all chapters are published.
 
 ---
 
@@ -11,9 +11,9 @@ This file tracks which chapters of **Long-Running Agent Systems** have been publ
 
 | # | Chapter | Status | Published At |
 |---|---------|--------|--------------|
-| 01 | The Problem with ChatGPT-style Agents | 🚧 Draft | - |
-| 2 | Durability as an Engineering Property | ✅ Published | 2026-08-03 19:44 UTC |
-| 3 | Externalizing Truth — Git as Memory | ✅ Published | 2026-08-03 20:00 UTC |
+| 01 | The Problem with ChatGPT-style Agents | ✅ Published | 2026-08-03 |
+| 02 | Durability as an Engineering Property | 🔒 Locked | - |
+| 03 | Externalizing Truth — Git as Memory | 🔒 Locked | - |
 | 04 | The Gather → Act → Verify → Checkpoint Cycle | 🔒 Locked | - |
 | 05 | Tool Dispatching and Sandboxing | 🔒 Locked | - |
 | 06 | Deterministic Verification — Exit Codes as Ground Truth | 🔒 Locked | - |
@@ -54,6 +54,6 @@ This file tracks which chapters of **Long-Running Agent Systems** have been publ
 
 ## Next Publication
 
-Next chapter to publish: **Chapter 01**
+Next chapter to publish: **Chapter 02**
 
-Scheduled for: see `.hermes/cron/course-publisher.json`
+Scheduled for: see cron job `Publish Long-Running Agent Course Chapter`
