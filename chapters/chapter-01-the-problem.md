@@ -5,108 +5,127 @@
 
 ## What We'll Cover
 
-- Why most "agents" aren't really autonomous
-- The three failure modes: crash, context, and API
-- Why **durability** is an engineering problem, not a model problem
-- Preview of the solution: externalized truth + durable execution + deterministic verification
+- Why chat-style agents don't survive real work
+- The four failure modes that kill them
+- What a durable agent looks like
+- The architecture we'll build in this course
 
 ---
 
-## The ChatGPT Agent Pattern
+## The ChatGPT Loop
 
-A typical "agent" looks like this:
+A typical ChatGPT-style agent works like this:
 
-```python
-while True:
-    response = model(messages)
-    action = parse(response)
-    result = execute(action)
-    messages.append(result)
+```
+user asks → model thinks → model responds → conversation ends
 ```
 
-Simple. Easy to demo. **Completely unreliable for real work.**
+For a single question, this is fine. For a week-long project, it is broken.
 
-### Three Failure Modes
-
-| Failure | What happens |
-|---------|--------------|
-| **Crash** | Process dies → all state lost → start over |
-| **Context overflow** | `messages` grows until the model forgets the goal |
-| **API failure** | One bad tool call kills the whole run |
-
-A demo that runs for 5 minutes doesn't prove anything. A production agent needs to run for **days or weeks**.
+The model has no memory of what happened yesterday unless you paste the whole conversation into the context window. The context window is limited. The cost grows. The agent forgets details. And if the server restarts, the conversation is gone.
 
 ---
 
-## Why Smarter Models Don't Fix This
+## Four Failure Modes
 
-GPT-5 won't make your loop survive a reboot. A more capable model can reason better inside one turn, but it can't remember what happened before the crash.
+| Failure | Why it breaks a chat agent |
+|---------|---------------------------|
+| **Crash** | A process restart loses all in-memory state. There is no resume. |
+| **Context limit** | Long missions exceed the model's token budget. Details get dropped. |
+| **API failure** | One bad model call halts everything. There is no retry or checkpoint. |
+| **No verification** | The model says the task is done, but the code doesn't compile or the tests fail. |
 
-**The fix is engineering:**
-- Treat the context window as a cache, not a database
-- Write state to disk/git/database every cycle
-- Journal every action so it can be replayed
-- Verify with real tests, not model self-assessment
-
----
-
-## The LRA Answer
-
-**LRA = Long-Running Agents** — an agent *organization* built for durability.
-
-Three pillars:
-
-### 1. Externalized Source of Truth
-The real state lives outside the model:
-- `progress.md` — what's been done
-- `checklist.json` — what remains
-- `decisions.ndjson` — why choices were made
-- `events.ndjson` — what happened every cycle
-
-The model re-reads this every turn. If you reboot on day 12, the agent reconstructs context in seconds.
-
-### 2. Durable Execution
-The loop runs inside a **Temporal workflow**. Every non-deterministic effect (LLM call, tool call, git commit) is journaled. A crash resumes exactly where it left off — no work lost, no tokens re-spent.
-
-### 3. Deterministic Verification
-A task is only "done" when tests/lint/build pass. The model doesn't get to say "looks good." Exit codes decide.
+A real autonomous agent must survive all four.
 
 ---
 
-## What We'll Build
+## What Is a Long-Running Agent?
 
-By the end of this course you'll have an agent that can:
-1. Accept a multi-day software mission
-2. Plan it into checkable items
-3. Execute one item per cycle
-4. Verify each item with real tests
-5. Checkpoint to git
-6. Resume after crashes
-7. Improve its own prompts from failure traces
-8. Run at **$0** on Ollama
+A long-running agent is a system that can:
+
+1. Plan a multi-step mission
+2. Work on it over hours, days, or weeks
+3. Survive crashes and restarts
+4. Verify its own work with real tests
+5. Learn from failures
+6. Ask a human only when necessary
+
+The agent is not a conversation. It is a **stateful workflow**.
+
+---
+
+## The Architecture We Will Build
+
+By the end of this course you will have this system:
+
+```
+┌─────────────────────────────────────┐
+│         MissionWorkflow           │  ← Temporal durable workflow
+│  (gather → act → verify → checkpoint) │
+└──────────────┬──────────────────────┘
+               │
+    ┌──────────┴──────────┬──────────────┐
+    │                     │              │
+┌───▼────┐           ┌────▼────┐   ┌────▼────┐
+│  Lead  │           │Researchers│   │ Reviewer │
+│Engineer│           │ (fan-out) │   │          │
+└───┬────┘           └─────────┘   └─────────┘
+    │
+┌───▼─────────────────────────────────┐
+│         Mission Anchor              │  ← git + four files
+│ progress.md | checklist.json |      │
+│ decisions.ndjson | events.ndjson    │
+└─────────────────────────────────────┘
+```
+
+Every chapter adds one real component to this architecture. By Chapter 30 you will run a week-long mission end-to-end.
+
+---
+
+## What We'll Build in Code
+
+This course ships with a working demo project in the `lra-demo/` folder. It starts as a tiny local runner and grows into a Temporal-backed, multi-agent system.
+
+In this chapter, inspect the project:
+
+```bash
+cd lra-demo
+ls -la src/lra/
+```
+
+You should see:
+
+```
+anchor.py
+local_runner.py
+loop.py
+tools.py
+verify.py
+```
+
+These are the foundation blocks. We will expand them as we go.
 
 ---
 
 ## Exercise
 
-Think of one long-horizon task you've tried to automate with an LLM.
-
-Examples:
-- Refactor a large codebase
-- Build a full feature end-to-end
-- Generate a 50-page report from research
-- Migrate from one framework to another
-
-**Write down three ways the simple loop would fail on that task.**
-
----
-
-## Preview of Chapter 02
-
-Next we'll look at **durability as an engineering property** — what it means for a system to be durable and how to design for interruption from the start.
+1. Read `lra-demo/src/lra/anchor.py`. Identify the four anchor files it manages.
+2. Run the tests:
+   ```bash
+   cd lra-demo
+   uv sync --extra dev
+   uv run pytest
+   ```
+3. Note which tests pass and which fail. We will fix failures in later chapters.
 
 ---
 
 ## Key Takeaway
 
-> The model thinks in short bursts. The system around it must run for weeks.
+> A long-running agent is not a long chat. It is a durable workflow with externalized state, deterministic verification, and the ability to resume after failure.
+
+---
+
+## Next Chapter
+
+**Chapter 02: Durability as an Engineering Property** — we will design every system component to survive interruption.

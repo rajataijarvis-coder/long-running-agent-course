@@ -1,13 +1,7 @@
 # Course Publication Status
 
-This file tracks which chapters of **Long-Running Agent Systems** have been published.
-
 **Total chapters:** 30
-**Publication schedule:** Every 20 minutes, until all chapters are published.
-
----
-
-## Published Chapters
+**Publication schedule:** Every 20 minutes, cron writes the next chapter from source + previous chapters.
 
 | # | Chapter | Status | Published At |
 |---|---------|--------|--------------|
@@ -42,18 +36,5 @@ This file tracks which chapters of **Long-Running Agent Systems** have been publ
 | 29 | Observability with OpenTelemetry and Langfuse | 🔒 Locked | - |
 | 30 | Capstone — A Week-Long Mission End-to-End | 🔒 Locked | - |
 
----
-
-## Legend
-
-- 🔒 Locked = Not yet published
-- 🚧 Draft = In progress / ready to publish
+- 🔒 Locked = Not yet written/published
 - ✅ Published = Live on GitHub
-
----
-
-## Next Publication
-
-Next chapter to publish: **Chapter 02**
-
-Scheduled for: see cron job `Publish Long-Running Agent Course Chapter`
