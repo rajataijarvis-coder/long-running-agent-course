@@ -13,7 +13,7 @@ This file tracks which chapters of **Long-Running Agent Systems** have been publ
 |---|---------|--------|--------------|
 | 01 | The Problem with ChatGPT-style Agents | 🚧 Draft | - |
 | 2 | Durability as an Engineering Property | ✅ Published | 2026-08-03 19:44 UTC |
-| 03 | Externalizing Truth — Git as Memory | 🔒 Locked | - |
+| 3 | Externalizing Truth — Git as Memory | ✅ Published | 2026-08-03 20:00 UTC |
 | 04 | The Gather → Act → Verify → Checkpoint Cycle | 🔒 Locked | - |
 | 05 | Tool Dispatching and Sandboxing | 🔒 Locked | - |
 | 06 | Deterministic Verification — Exit Codes as Ground Truth | 🔒 Locked | - |
