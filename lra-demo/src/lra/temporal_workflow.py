@@ -8,13 +8,12 @@ from typing import Any
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
 
 from lra.anchor import MissionAnchor
 from lra.loop import AgentLoop
-from lra.review import ReflectionResult, StaticReviewer
+from lra.review import ReflectionResult, StaticReviewer, build_review_and_reflect
 from lra.tools import ToolDispatcher
-from lra.verify import DeterministicVerifier, VerificationResult
+from lra.verify import DeterministicVerifier
 
 
 @dataclass
@@ -49,16 +48,8 @@ async def load_anchor(workdir: str) -> dict[str, Any]:
 
 @activity.defn
 async def run_one_cycle(cycle_input: CycleInput) -> CycleOutput:
-    """Runs gather → act → verify for one checklist item.
-
-    This is the side-effecting core of the agent. Temporal journals the result.
-    """
+    """Runs gather → act → verify for one checklist item."""
     anchor = MissionAnchor(cycle_input.workdir)
-    loop = AgentLoop(
-        anchor=anchor,
-        tools=ToolDispatcher(),
-        verifier=DeterministicVerifier.from_workdir(cycle_input.workdir),
-    )
     item = next(
         (i for i in anchor.read_checklist()["items"] if i["id"] == cycle_input.item_id),
         None,
@@ -66,20 +57,24 @@ async def run_one_cycle(cycle_input: CycleInput) -> CycleOutput:
     if item is None:
         return CycleOutput(item_id=cycle_input.item_id, all_passed=False, error="item not found")
 
+    # Idempotency guard: already-done items should not re-run.
+    if item.get("status") == "done":
+        return CycleOutput(item_id=cycle_input.item_id, all_passed=True)
+
     from lra.anchor import ChecklistItem
     checklist_item = ChecklistItem(**item)
+    loop = AgentLoop(
+        anchor=anchor,
+        tools=ToolDispatcher(),
+        verifier=DeterministicVerifier.from_workdir(cycle_input.workdir),
+    )
     blocked = loop.cycle(checklist_item)
-    result = VerificationResult(checks=[])
-    reflection: ReflectionResult | None = None
+    reflection = None
     if blocked:
-        _, reflect = __import__("lra.review", fromlist=["build_review_and_reflect"]).build_review_and_reflect(anchor)
+        _, reflect = build_review_and_reflect(anchor)
         reflection = reflect.reflect(cycle_input.item_id)
 
-    return CycleOutput(
-        item_id=cycle_input.item_id,
-        all_passed=not blocked,
-        reflection=reflection,
-    )
+    return CycleOutput(item_id=cycle_input.item_id, all_passed=not blocked, reflection=reflection)
 
 
 @activity.defn
@@ -114,6 +109,7 @@ class MissionWorkflow:
         )
         items = anchor_state["checklist"].get("items", [])
 
+        results = []
         for item in items:
             if item.get("status") in ("done",):
                 continue
@@ -127,10 +123,8 @@ class MissionWorkflow:
                     maximum_attempts=3,
                 ),
             )
-            if not cycle_out.all_passed:
-                break
-
-        # Return fresh anchor state for the client.
+            results.append({"item_id": cycle_out.item_id, "all_passed": cycle_out.all_passed})
+            # Continue to next item even if one is blocked; review is handled by activities.
         return await workflow.execute_activity(
             load_anchor,
             mission_input.workdir,

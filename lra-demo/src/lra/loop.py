@@ -41,7 +41,7 @@ class AgentLoop:
         elif "test" in item.description.lower() and item.id == "2":
             result = self.tools.dispatch("write_file", {
                 "path": str(self.anchor.workdir / "tests" / "test_hello.py"),
-                "content": "import hello\n\ndef test_hello_output(capsys):\n    hello.main()\n    captured = capsys.readouterr()\n    assert captured.out == "Hello, durable world!\n"\n",
+                "content": "import hello\n\ndef test_hello_output(capsys):\n    hello.main()\n    captured = capsys.readouterr()\n    assert captured.out == 'Hello, durable world!\\n'\n",
             })
         else:
             result = {"ok": False, "error": "No implementation for this item"}

@@ -52,18 +52,32 @@ class StaticReviewer:
             findings.append(f"Item {item_id} is marked done but has no verification record.")
             suggestions.append("Run deterministic verification and record the check names.")
 
+        # Rule 1b: a verified done item with a claimed file should have that file.
+        # This rule is applied only when there is a verification record; otherwise
+        # the missing record is the primary issue.
+        if item["status"] == "done" and item.get("verified_by"):
+            claimed_file = self._guess_output_file(item["description"])
+            full_path = self.anchor.workdir / claimed_file if claimed_file else None
+            if full_path and not full_path.exists():
+                finding = f"Claimed output file {claimed_file} does not exist."
+                findings.append(finding)
+                suggestions.append(f"Write {claimed_file.name} or update the item description.")
+
         # Rule 2: blocked items must explain why in the progress log.
         progress = self.anchor.read_progress()
         if item["status"] == "blocked" and f"Item {item_id}" not in progress:
             findings.append(f"Item {item_id} is blocked but progress.md contains no entry.")
             suggestions.append("Append a failure note to progress.md before retrying.")
 
-        # Rule 3: output files that were claimed to be written should exist.
-        if "create" in item["description"].lower() or "write" in item["description"].lower():
-            claimed_file = self._guess_output_file(item["description"])
-            if claimed_file and not claimed_file.exists():
-                findings.append(f"Claimed output file {claimed_file} does not exist.")
-                suggestions.append(f"Write {claimed_file.name} or update the item description.")
+        # Rule 3: non-done items that create files are checked only when not blocked.
+        if item["status"] not in ("done", "blocked"):
+            if "create" in item["description"].lower() or "write" in item["description"].lower():
+                claimed_file = self._guess_output_file(item["description"])
+                full_path = self.anchor.workdir / claimed_file if claimed_file else None
+                if full_path and not full_path.exists():
+                    finding = f"Claimed output file {claimed_file} does not exist."
+                    findings.append(finding)
+                    suggestions.append(f"Write {claimed_file.name} or update the item description.")
 
         approved = len(findings) == 0
         return ReviewResult(

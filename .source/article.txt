@@ -1,0 +1,1642 @@
+Get app
+Write
+
+Sign up
+
+Sign in
+
+Level Up Coding
+
+Coding tutorials and news. The developer homepage gitconnected.com && skilled.dev && levelup.dev
+
+Follow publication
+
+Top highlight
+
+1
+
+1
+
+You're reading for free via Fareed Khan's Friend Link. Become a member to access the best of Medium.
+
+Member-only story
+
+AI
+Artificial Intelligence
+Data Science
+Machine Learning
+Python
+Building a Week-Long Running Agentic System
+Durability is an engineering property, not a model capability
+Fareed Khan
+Follow
+56 min read
+·
+Jun 5, 2026
+
+1K
+
+10
+
+7
+
+Read this story for free: link
+
+Most AI agents are a single loop that dies the moment the process restarts, the context window fills up, or one API call fails. That is fine for a quick chat, but it falls apart on long horizon tasks that run for days or weeks. In this blog we build an agent that keeps running across that whole stretch. It plans its own work, builds and tests real software, and learns from its failures to improve itself for the next run. The model does not need to be any smarter for this. The system around it does the heavy lifting.
+
+Week long running agentic system (Created by Fareed Khan)
+
+Here is the shape of the whole thing before we build it. A human can approve and steer through durable signals. A durable control plane schedules the work. An agent team does the work, with one lead engineer and a few helpers. The real state lives in git plus a tiered memory, and a deterministic verifier is the only thing allowed to call a piece of work done.
+
+I wanted to see how far we can push the other direction.
+What if we treat long horizon autonomy as an engineering problem instead of a model capability?
+The model thinks in short bursts, and the system runs for weeks by doing three boring things very well. It keeps the real state outside the model, it journals every step, and it verifies progress with real tests.
+
+Throughout this blog I will follow one concrete task so the ideas stay grounded. The task is to build a small Python language server (an LSP server) from scratch, and it takes the system about a week. The trace below is a representative run of that task, and by the end of the blog you will understand every line of it.
+
+2026-06-02T08:44:51.880Z INFO  mission.complete items=14/14 cycles=615 head=9d8c7b6 status=DONE
+2026-06-02T08:44:51.900Z INFO  governor.final cum_usd=178.60 ceiling=400.00 crashes_survived=1
+                               loop_trips=1 reviewer_blocking=2 scope_cuts=1 skills_learned=2
+
+That single task survived a host reboot, tripped a loop detector once, got blocked twice by an independent reviewer, cut its own scope when it over planned, and learned two reusable skills along the way. All for 178 dollars and 60 cents of tokens against a 400 dollar ceiling. Let us build the system that produced that line, one piece at a time.
+
+Code Overview
+
+All the code lives in a Python package called lra (short for Long Running Agents). You can find the full project on GitHub:
+
+GitHub - FareedKhan-dev/long-running-agent: A step by step implementation to build an agent that…
+A step by step implementation to build an agent that runs for week to complete a task and self improve. …
+
+github.com
+
+The codebase is large, so instead of dumping the whole tree, here is the map of the parts that matter. Each folder is one responsibility, and we will walk through them in roughly this order.
+
+src/lra/
+├── durable/        # the Temporal control plane: workflows, activities, replay, claim-check
+├── state/          # the git saved-state files: the real state on disk
+├── contracts/      # the typed interfaces (state, model, tools, verify, memory, hitl)
+├── agent/          # the inner loop: think -> act -> verify -> checkpoint, plus compaction
+├── agents/         # the organization: planner, lead, researchers, reviewer, evolver, judge
+├── coordination/   # ownership map, decision log, blackboard, tickets
+├── model/          # pluggable LLM backends: stub, ollama, openai_compat, claude
+├── execution/      # the tool dispatcher and the sandbox (local, docker, e2b)
+├── safety/         # default-deny egress + the rule of two
+├── verify/         # the deterministic verifier, mutation testing, trust bootstrap
+├── governor/       # the budget governor + loop detector
+├── hitl/           # human-in-the-loop gates
+├── memory/         # tiered memory, embeddings, hybrid retrieval, skills
+└── evals/          # the offline eval harness for self-improvement
+Press enter or click to view image in full size
+How the lra package is organized by responsibility (Created by Fareed Khan)
+
+The model layer is pluggable, so you can run the whole system for zero dollars. A local Ollama model or a free tier cloud model costs nothing, and a `stub` model is used for tests. You only pay for tokens when you point it at a paid API like Claude. Here is the quickstart:
+
+# install (this provisions Python 3.12 for you)
+uv sync
+uv run lra version
+uv run lra config        # show the resolved config, with secrets redacted
+
+# run a mission locally, no servers needed (uses the stub model at $0)
+uv run lra mission --task \"Create a hello.py that prints hello and a test for it\" \\
+                   --workdir .lra/workspaces/demo
+
+That lra mission command plans the task into a checklist and then works each item until it is verified. In the commands and logs you will see this called a mission, as in lra mission, which is just the system’s word for one run on one task. Everything it does is real git history, so you can inspect the work afterwards with git -C .lra/workspaces/demo log --oneline. Now let us understand why the system is built the way it is.
+
+Table of Contents
+The Core Idea: Assume Interruption
+∘ The Context Window Is a Lossy Cache
+∘ The Real State Lives Outside the Window
+The Saved State
+∘ The Checklist
+∘ Decisions and Events
+∘ Reading Where Things Stand
+∘ Committing a Checkpoint
+The Agent Cycle
+∘ Think, Act, Verify, Checkpoint
+∘ The Tool Loop
+∘ Context Compaction
+The Model Layer
+∘ One Interface, Many Backends
+∘ Real Tokens, Real Cost
+∘ Failover
+Tools and the Sandbox
+∘ The Allow-List Dispatcher
+∘ The Sandbox
+Deterministic Verification
+∘ The Exit Code Decides
+∘ Trusting the Gate
+∘ Flaky Quarantine
+The Durable Backbone
+∘ The Deterministic Scheduler
+∘ Journaled Activities and Replay
+∘ Durable Sleep and Continue-As-New
+∘ The Claim-Check Codec
+∘ Sagas and Compensation
+The Uneven Team
+∘ Why Multi-Agent Is a Cost
+∘ Roles and Model Tiers
+∘ The Planner
+∘ Single-Writer-Per-File Ownership
+∘ Researcher Fan-Out
+∘ The Fresh-Context Reviewer
+∘ The Decision Log
+Staying Safe and On Budget
+∘ The Budget Governor
+∘ The Loop Detector
+∘ Default-Deny Egress
+∘ The Rule of Two
+∘ Human-in-the-Loop Gates
+Memory That Survives Weeks
+∘ Three Tiers of Memory
+∘ Embeddings
+∘ Hybrid Retrieval
+∘ Consolidation
+∘ The Skill Library
+Making the Lesson Permanent
+∘ Proposing a Better Prompt
+∘ The Eval Harness and the Judge
+∘ The Promotion Gate
+A Week in the Life of a Task
+∘ Day Zero: Research and Plan
+∘ The Hard Part
+∘ Crash and Replay
+∘ Getting Unstuck
+∘ Fan-Out and the Final Gate
+What Is Proven vs Frontier
+What’s Next
+The Core Idea: Assume Interruption
+
+Before any code, we need the one idea that everything else hangs on. If an agent has to run for a week, then over that week it will be interrupted. The machine will reboot, the API will rate limit, the context window will overflow, the worker process will get killed by a deploy. Interruption is not an edge case here. It is the normal case. So we design for it from the start, and the rule we follow is simple: assume interruption.
+
+The Context Window Is a Lossy Cache
+
+The most common mistake is to treat the model’s context window as the agent’s memory. It is not. The context window is a small, lossy cache. It holds a few hundred thousand tokens at most, it gets summarized or truncated when it fills, and it vanishes entirely when the process restarts. If our agent’s understanding of “where am I in this task” lives only in the context window, then the first interruption erases it.
+
+Press enter or click to view image in full size
+The context window is a small lossy cache that vanishes on interruption (Created by Fareed Khan)
+
+So the context window is going to fill up after thousands of turns, and a crash or a reboot will throw it away. When that happens, a naive agent loses all sense of where things stand. It does not know which files it already wrote, which tests already pass, or which design decisions it already made. This is exactly why most long agent runs fall apart. We are going to fix this by moving the real state somewhere that does not disappear.
+
+The Real State Lives Outside the Window
+
+The fix is to keep the real state of the task outside the model, in a place that survives anything. We use a git repository plus a few structured files inside it. The model reads this state at the start of every cycle to catch up, does a small amount of work, and commits the result back. The context window becomes disposable, because the state is never in it.
+
+Press enter or click to view image in full size
+The real state lives in git, re-read every cycle and committed back (Created by Fareed Khan)
+
+This is the whole idea in one picture. The real state is a git repo plus a small set of saved state files. The model reads it fresh every cycle, so a brand new model with an empty context window can rebuild full awareness in seconds. Then it commits its results back into the same state. A crash between cycles loses nothing, because the only durable state is the part we already committed. Now let us build that saved state.
+
+The Saved State
+
+The saved state is the set of files that hold everything that matters. It lives in a folder called .lra/ inside the repository we are working on, and it is committed to git alongside the actual code changes. That way, one commit captures both the work and the progress on the work. Let us look at the data first, because the data is the design.
+
+The Checklist
+
+The center of the saved state is a checklist. Each item is one small unit of work, and an item can only be in one of four states. It is todo, in_progress, blocked, or done. The important rule, which we will enforce later, is that an item flips to done only after a real test proves it. Here is the data model, written with Pydantic.
+
+# src/lra/contracts/state.py
+
+ItemStatus = Literal[\"todo\", \"in_progress\", \"blocked\", \"done\"]
+
+
+class ChecklistItem(BaseModel):
+    \"\"\"One mission work-unit; flips to `done` only after deterministic verification.\"\"\"
+
+    id: str
+    description: str
+    status: ItemStatus = \"todo\"
+    # IDs of the checks (tests/lint) that actually proved this item done.
+    verified_by: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)  # other item ids
+    attempts: int = 0                                     # how many tries so far
+    notes: str = \"\"
+    schema_version: int = 1                               # for safe migrations later
+
+    @property
+    def is_open(self) -> bool:
+        return self.status in (\"todo\", \"in_progress\", \"blocked\")
+
+Each item carries its own dependency list and an attempt counter. The verified_by field is an audit trail. It records the names of the checks that proved the item done, so later we can answer “how do we know this works?” with a concrete answer instead of a guess. Now the checklist itself is just an ordered list of these items, plus one very important method.
+
+class Checklist(BaseModel):
+    items: list[ChecklistItem] = Field(default_factory=list)
+    schema_version: int = 1
+
+    def next_actionable(self) -> ChecklistItem | None:
+        \"\"\"Return the first open item whose dependencies are all done, else None.\"\"\"
+        done = {i.id for i in self.items if i.status == \"done\"}
+        for item in self.items:
+            if item.is_open and all(dep in done for dep in item.depends_on):
+                return item
+        return None
+
+    @property
+    def all_done(self) -> bool:
+        return bool(self.items) and all(i.status == \"done\" for i in self.items)
+
+The next_actionable method is how the agent always knows what to do next. It walks the list and returns the first open item whose dependencies are all complete. This is what lets a fresh agent, with no memory, pick up exactly where the last one left off. It does not need to remember anything. It just asks the checklist.
+
+Press enter or click to view image in full size
+The checklist picks the next open item whose dependencies are done (Created by Fareed Khan)
+Decisions and Events
+
+A checklist tells you what is left, but it does not tell you why earlier choices were made, and it does not give you a blow by blow history. For those, we keep two append-only logs next to the checklist. One is for decisions, and one is for events.
+
+class DecisionRecord(BaseModel):
+    \"\"\"A durable, never-compacted record of an implicit design decision (anti-drift).\"\"\"
+
+    decision: str               # e.g. \"use a synchronous read loop, not asyncio\"
+    rationale: str
+    alternatives_rejected: str = \"\"
+    affected: list[str] = Field(default_factory=list)   # item ids this touches
+    cycle_id: str = \"\"
+
+
+class EventRecord(BaseModel):
+    \"\"\"One entry in the append-only episodic event log.\"\"\"
+
+    kind: str                   # \"cycle\", \"tool_call\", \"verification\", ...
+    cycle_id: str = \"\"
+    payload: dict[str, object] = Field(default_factory=dict)
+    # Pointer to a large blob in the object store, to keep the log compact.
+    payload_ref: str | None = None
+
+The decision log matters more than it looks. When the context window gets compacted, the first things to get dropped are the small implicit decisions, like “we chose to read bytes directly instead of using input()\". Those are exactly the decisions that cause drift later, when a future cycle quietly contradicts a past one. By writing them to an append-only file that is never compacted, we can always check new work against old decisions.
+
+Press enter or click to view image in full size
+Decisions and events are append-only logs that never get compacted away (Created by Fareed Khan)
+Reading Where Things Stand
+
+Now the key operation. At the start of every single cycle, the agent rebuilds its full awareness from these files plus the git log. This is the “assume interruption” rule turned into a method. Here is the read path, from the GitMissionAnchor class.
+
+# src/lra/state/mission_anchor.py
+
+def _read_sync(self) -> SituationSnapshot:
+    checklist = self._read_checklist()
+    progress = \"\"
+    progress_path = self._path(PROGRESS_FILE)
+    if progress_path.exists():
+        progress = progress_path.read_text(encoding=\"utf-8\")
+
+    # The active item is whatever is in_progress, else the next actionable one.
+    active = next((i for i in checklist.items if i.status == \"in_progress\"), None)
+    if active is None:
+        active = checklist.next_actionable()
+
+    return SituationSnapshot(
+        head_sha=git_ops.head_sha(self.workdir),
+        recent_commits=git_ops.log_oneline(self.workdir, 10),
+        progress_summary=progress,
+        open_items=[i for i in checklist.items if i.is_open],
+        last_decisions=self._read_recent_decisions(5),
+        active_item=active,
+        is_complete=checklist.all_done,
+    )
+
+Read that method slowly, because it is the core of the whole system. It opens the checklist file, reads the progress narrative, finds the active item, pulls the last ten git commits and the last five decisions, and packs it all into one SituationSnapshot. This runs in milliseconds, and it works for a brand new process that has never seen this task before. That is what makes a crash a non event. The next worker just reads the snapshot and continues.
+
+Press enter or click to view image in full size
+The current state is rebuilt from git and the state files in milliseconds (Created by Fareed Khan)
+Committing a Checkpoint
+
+The other half is writing. When a cycle finishes, we write the updated files and commit them in a single atomic git commit. If the commit succeeds, the real state advanced. If anything crashed before the commit, the real state simply did not advance, and the next cycle retries the same item. There is no half-done state.
+
+def _commit_sync(self, checkpoint: Checkpoint) -> str:
+    self.anchor.mkdir(parents=True, exist_ok=True)
+    self._write_checklist(checkpoint.checklist)              # checklist.json
+    if checkpoint.progress_summary:
+        self._path(PROGRESS_FILE).write_text(checkpoint.progress_summary, encoding=\"utf-8\")
+    if checkpoint.decisions:                                 # append, never overwrite
+        with self._path(DECISIONS_FILE).open(\"a\", encoding=\"utf-8\") as fh:
+            for decision in checkpoint.decisions:
+                fh.write(decision.model_dump_json() + \"\
+\")
+    if checkpoint.events:                                    # append, never overwrite
+        with self._path(EVENTS_FILE).open(\"a\", encoding=\"utf-8\") as fh:
+            for event in checkpoint.events:
+                fh.write(event.model_dump_json() + \"\
+\")
+    message = checkpoint.commit_message or f\"lra: checkpoint {checkpoint.cycle_id}\"
+    return git_ops.commit_all(self.workdir, message)         # git add -A && git commit
+
+Notice the decisions and events are appended, not overwritten, while the checklist is rewritten in full. The whole thing ends with one git commit. Because the commit message is deterministic and readable, the git history itself becomes a human readable progress report. Here is what the history looks like after a small three item task finishes.
+
+#### OUTPUT ####
+$ git -C .lra/workspaces/demo log --oneline
+9d8c7b6 lra: complete 03 (task 3)
+b3c4d5e lra: complete 02 (task 2)
+a1f2e3d lra: complete 01 (task 1)
+0c1d2e3 lra: initialize mission anchor
+
+One commit per finished item, plus the initial commit that created the saved state. You can read the entire task from the git log without any special tools. This is the benefit of putting the real state in git. Now we have a place to store progress. Next we need the loop that actually makes that progress.
+
+Press enter or click to view image in full size
+A checkpoint writes the state files and commits them in one atomic commit (Created by Fareed Khan)
+The Agent Cycle
+
+We have a place to store the real state. Now we need the loop that reads it, does a little work, and writes it back. I call this one unit of work a cycle. A cycle is deliberately small. It works on one checklist item, runs the model for a few turns, verifies the result, and commits. Keeping the unit small is what makes the system resilient, because the most we can ever lose to a crash is a single unfinished cycle.
+
+Think, Act, Verify, Checkpoint
+
+Every cycle follows the same four steps. It reads where things stand from git, it acts by running the model and its tools, it verifies the result with real checks, and it checkpoints the outcome back to git. Then it repeats.
+
+Press enter or click to view image in full size
+One cycle: read the state, act with tools, verify, then checkpoint (Created by Fareed Khan)
+
+Here is the top of the cycle, from the AgentLoop class. The first thing it does is read the snapshot, and if the task is already complete, it returns immediately. That early return is what makes the whole loop idempotent.
+
+# src/lra/agent/loop.py
+
+async def run_cycle(self, *, ctx, mission_id, cycle_id, anchor_text, checks=None):
+    checks = checks or []
+    snapshot = await self._anchor.read_situational_awareness()
+    # Idempotent guard: if there is nothing left to do, this cycle is a no-op.
+    if snapshot.is_complete or snapshot.active_item is None:
+        return CycleOutcome(
+            item_id=None, advanced=False, verified=False,
+            is_complete=True, head_sha=snapshot.head_sha, tool_calls=0, turns=0,
+        )
+
+    item = snapshot.active_item  # the one thing we will work on this cycle
+    messages = build_messages(
+        anchor_text=anchor_text, snapshot=snapshot, item=item,
+        specs=self._dispatcher.specs(),   # the tools this agent is allowed to use
+    )
+
+The cycle picks exactly one item, the active item from the snapshot, and builds a prompt that includes the progress so far, the open items, and the tools it is allowed to call. Notice that it never trusts its own memory for what to work on. It always asks the freshly read snapshot. Now it enters the part where it actually thinks and acts.
+
+The Tool Loop
+
+Inside a cycle, the model and the tools take turns. The model produces either a tool call or a “done” signal. If it is a tool call, we run the tool, feed the result back as an observation, and ask the model again. We repeat this up to a fixed number of turns, so a confused model can never loop forever inside a single cycle.
+
+Press enter or click to view image in full size
+The model and tools take turns until the model signals done or the turn cap is hit (Created by Fareed Khan)
+tool_calls = 0
+for turns in range(1, self._max_turns + 1):
+    result = await self._model.complete(messages)     # one real model turn
+    if self._ledger is not None:                      # record real token cost
+        self._ledger.record(
+            cycle_id=cycle_id, usage=result.usage,
+            usd=self._model.estimate_cost_usd(result.usage),
+        )
+
+    action = parse_action(result.text, result.tool_calls)
+    if action.done or action.tool is None:            # the model says it is finished
+        messages.append(ModelMessage(role=\"assistant\", content=result.text))
+        break
+
+    # Run the requested tool through the safety gate (more on that gate later).
+    call = ToolCall(id=f\"{cycle_id}-{turns}\", name=action.tool, arguments=action.arguments)
+    tool_result = await self._dispatcher.dispatch(call, ctx)
+    tool_calls += 1
+    observation = (tool_result.content or tool_result.error or \"\")[:4000]
+    messages.append(ModelMessage(role=\"assistant\", content=result.text))
+    messages.append(ModelMessage(role=\"user\", content=f\"OBSERVATION ({action.tool}): {observation}\"))
+
+Every model turn records its real token usage into a cost ledger, which we will use later to enforce a budget. The observation we feed back is capped at four thousand characters, so a giant tool output cannot blow up the context. When the model finally signals it is done, we break out and move to verification. Here is one cycle from the real LSP task, where the lead engineer writes the transport file and runs the test.
+
+#### OUTPUT ####
+07:30:04 INFO  lead.turn cycle=c1 model=claude-opus-4-8 tok_in=8112 tok_out=905 cache_read=5900 cost=0.0712
+07:30:16 INFO  tool.exec cycle=c1 name=write_file path=pylsp_mini/transport.py bytes=812
+08:01:59 INFO  tool.exec cycle=c1 name=run_command cmd=\"uv run pytest tests/test_initialize.py -q\" -> exit=1
+    tests/_fakeclient.py:55: in _read_response
+        header = self._read_until(b\"\\r\
+\\r\
+\")
+    E   Failed: Timeout >10.0s
+08:02:10 WARN  verify.fail cycle=c1 attempt=1 reason=timeout tests=0/1
+
+One model turn, one file written, one test run, and it failed with a timeout. That is a perfectly normal cycle. The work did not pass, so the item will not be marked done. Instead it gets recorded as a failed attempt and the next cycle will try again. This is the system working exactly as designed, and we will follow this particular bug to its conclusion later.
+
+Context Compaction
+
+A single cycle can run many turns, and the message list grows with each tool call and observation. If a cycle explores a lot, that list can get long enough to strain the window. So we compact it. We keep the system prompt and the most recent few turns exactly as they are, and we summarize everything older into one compact note.
+
+Press enter or click to view image in full size
+Compaction keeps the system prompt and recent turns, summarizing the older ones (Created by Fareed Khan)
+# src/lra/agent/compaction.py
+
+async def compact_messages(*, model, messages, keep_last=4):
+    \"\"\"Return system + a summary-of-older-turns + the last `keep_last` turns.\"\"\"
+    system = [m for m in messages if m.role == \"system\"][:1]    # never compact this
+    body = [m for m in messages if m.role != \"system\"]
+    if len(body) <= keep_last:
+        return messages                                         # nothing to do yet
+
+    to_summarize = body[:-keep_last]                            # older turns
+    recent = body[-keep_last:]                                  # keep these verbatim
+    transcript = \"\
+\".join(f\"{m.role}: {m.content}\" for m in to_summarize)[:12000]
+    result = await model.complete([
+        ModelMessage(role=\"system\", content=_SUMMARY_INSTRUCTIONS),
+        ModelMessage(role=\"user\", content=transcript),
+    ])
+    summary = ModelMessage(role=\"user\", content=f\"[compacted summary]\
+{result.text[:4000]}\")
+    return [*system, summary, *recent]
+
+The summary instruction is specific. It tells the model to preserve the task, the key decisions and why they were made, the discoveries including failed approaches, and the next steps. The system prompt is never compacted, because it is essential. This keeps a long exploration inside the window without throwing away the facts that matter. It is worth noticing that this in-context compaction is a smaller, faster cousin of the durable state in git. The git saved state survives across cycles and crashes, while compaction just keeps one long cycle tidy.
+
+The Model Layer
+
+The cycle calls self._model.complete(...), but it never cares which model that is. That indirection is on purpose. The whole system talks to exactly one interface, and we can swap the actual model behind it with a single config change. This is what lets the same code run for zero dollars on a local model in a test, and on Claude in production.
+
+One Interface, Many Backends
+
+The interface is a small Protocol. A model takes a list of messages and returns a real result with real token usage. That is it.
+
+Press enter or click to view image in full size
+One ModelProvider interface with swappable stub, ollama, openai, and claude backends (Created by Fareed Khan)
+# src/lra/contracts/model.py
+
+@runtime_checkable
+class ModelProvider(Protocol):
+    \"\"\"A pluggable LLM backend. Implementations live in src/lra/model/.\"\"\"
+
+    name: str
+
+    async def complete(self, messages, *, tools=None, max_tokens=None) -> \"TurnResult\":
+        \"\"\"Run one real model turn and return its real output + usage.\"\"\"
+        ...
+
+    def estimate_cost_usd(self, usage: \"Usage\") -> float:
+        \"\"\"Compute real USD cost from real token counts (0.0 for local/free backends).\"\"\"
+        ...
+
+
+class Usage(BaseModel):
+    \"\"\"Real token accounting as reported by the provider.\"\"\"
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    model: str = \"\"
+
+There are four implementations of this interface. The stub model is deterministic and free, and it is used in tests so the whole system can be exercised without a network or a key. The ollama and openai_compat backends talk to local or free tier cloud models. The claude backend talks to Anthropic’s Messages API. They all return the same TurnResult with a real Usage, so the rest of the system never knows the difference. The Claude backend even reports prompt cache tokens separately, which matters a lot for cost over a long run.
+
+# src/lra/model/claude.py  (the price table, dollars per million tokens)
+
+_PRICES: dict[str, tuple[float, float]] = {
+    \"claude-opus-4-8\": (15.0, 75.0),     # (input, output)
+    \"claude-sonnet-4-6\": (3.0, 15.0),
+    \"claude-haiku-4-5-20251001\": (1.0, 5.0),
+}
+Real Tokens, Real Cost
+
+Every model turn returns a real token count, and we turn that into a real dollar figure and append it to a ledger. The key point is that this number is real. We never estimate or fake the cost. We read it from the provider’s own response. The ledger is tiny.
+
+Press enter or click to view image in full size
+Every turn records real token usage into a cost ledger the governor reads (Created by Fareed Khan)
+# src/lra/governor/cost.py
+
+class CostLedger(BaseModel):
+    entries: list[CostEntry] = Field(default_factory=list)
+
+    def record(self, *, cycle_id: str, usage: Usage, usd: float) -> CostEntry:
+        entry = CostEntry(
+            cycle_id=cycle_id, model=usage.model,
+            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens, usd=usd,
+        )
+        self.entries.append(entry)
+        return entry
+
+    @property
+    def total_usd(self) -> float:
+        return sum(e.usd for e in self.entries)
+
+    def mean_usd_per_cycle(self) -> float:
+        cycles = {e.cycle_id for e in self.entries}
+        return self.total_usd / len(cycles) if cycles else 0.0
+
+The ledger keeps a running total and a mean cost per cycle. That mean is what lets the budget governor predict the cost of the next step before it runs. Local and free backends record a genuine zero, while still tracking tokens, so the cost machinery is exercised even in a free run. Here is what a few model turns look like in the trace, with the cache reads doing real work.
+
+#### OUTPUT ####
+07:30:45 INFO  planner.turn cycle=replan-1 model=claude-opus-4-8 tok_in=7740 tok_out=1410 cache_read=6100 cost=0.0731
+07:31:40 INFO  lead.turn   cycle=c201    model=claude-opus-4-8 tok_in=9340 tok_out=1190 cache_read=8100 cost=0.0841
+11:24:40 INFO  governor.tick cum_usd=103.90 tests=9/14
+
+Look at cache_read=8100 on that lead turn. Most of the input was served from the prompt cache, which is far cheaper than fresh input tokens. Over a week of cycles that re-read a lot of the same context, the cache is the difference between an affordable run and an expensive one. And the governor.tick line shows the running total being tracked, here at 103 dollars and 90 cents with 9 of 14 items green.
+
+Failover
+
+A week is long enough that one provider will have a bad moment. So we can wrap several providers in a FailoverModel. It tries them in order and returns the first success. Only if every provider fails does it raise.
+
+Press enter or click to view image in full size
+Failover tries providers in order and returns the first success (Created by Fareed Khan)
+# src/lra/model/failover.py
+
+class FailoverModel(ModelProvider):
+    \"\"\"Try providers in order; return the first success, raise only if all fail.\"\"\"
+
+    def __init__(self, providers: list[ModelProvider]) -> None:
+        if not providers:
+            raise ValueError(\"FailoverModel needs at least one provider\")
+        self._providers = providers
+        self.name = \"failover:\" + \",\".join(p.name for p in providers)
+
+This is a small piece of code, but it is the reason a transient outage on one API does not end a week long task. The task just continues on the fallback model, and because the model layer is one interface, nothing else in the system has to know it happened. There is also an operational mode where, if every model is hard down, the task parks itself in a durable sleep and alerts a human instead of burning retries. We will see that durable sleep soon.
+
+Tools and the Sandbox
+
+The model cannot touch the world directly. It can only ask for a tool to be run, and every such request passes through a single gate. That gate is where all the safety lives, and it sits in code below the model, not in a prompt that a clever input could talk its way around.
+
+The Allow-List Dispatcher
+
+The AllowListDispatcher is the one and only path from a model’s request to a real action. It checks four things before it runs anything. Is the tool known, is it on the allow list, is mutation allowed if this tool mutates, and is egress allowed if this tool reaches the network. Egress is default deny.
+
+Press enter or click to view image in full size
+Every tool call passes the allow-list dispatcher before it can run (Created by Fareed Khan)
+# src/lra/execution/dispatcher.py
+
+async def dispatch(self, call: ToolCall, ctx: ToolContext) -> ToolResult:
+    tool = self._tools.get(call.name)
+    if tool is None:
+        return ToolResult.failure(f\"unknown tool: {call.name!r}\")
+    if not self._permitted(call.name):
+        return ToolResult.failure(f\"tool not allowed: {call.name!r}\")
+    if tool.spec.mutating and not self._allow_mutating:
+        return ToolResult.failure(f\"mutating tools are disabled: {call.name!r}\")
+    if tool.spec.egress and not self._allow_egress:
+        return ToolResult.failure(f\"egress is disabled (default-deny): {call.name!r}\")
+
+    missing = _missing_required(tool.spec.parameters, call.arguments)
+    if missing:
+        return ToolResult.failure(f\"missing required args for {call.name!r}: {sorted(missing)}\")
+
+    try:
+        return await tool.run(call.arguments, ctx)
+    except Exception as exc:  # a tool failure must NEVER crash the agent loop
+        return ToolResult.failure(f\"{type(exc).__name__}: {exc}\")
+
+There are two things I want to point out. First, the gate is enforced in code, below the model. A prompt injection cannot grant itself a tool, because the model is never even told a forbidden tool exists. Second, the final try/except means a tool that throws does not crash the cycle. It returns a failure result that becomes an observation, and the model gets to react to it. The loop is unbreakable from the tool side. Different roles get different dispatchers, so a read-only researcher literally cannot be handed a mutating tool.
+
+The Sandbox
+
+Tools that run commands do not run on the host. They run inside a sandbox, which is just another interface with three implementations. A local subprocess sandbox for development, a Docker sandbox for CI, and an E2B micro VM sandbox for production. The agent loop talks to the interface and never knows which one is underneath.
+
+Press enter or click to view image in full size
+One sandbox interface with local, docker, and E2B implementations plus snapshots (Created by Fareed Khan)
+# src/lra/contracts/sandbox.py
+
+@runtime_checkable
+class Sandbox(Protocol):
+    name: str
+
+    async def open(self, *, workdir: str, snapshot_id: str | None = None) -> \"SandboxSession\":
+        \"\"\"Open (or restore from snapshot_id) a session rooted at workdir.\"\"\"
+        ...
+
+    async def snapshot(self, session: \"SandboxSession\") -> \"Snapshot\":
+        \"\"\"Persist the session's state and return a restorable handle.\"\"\"
+        ...
+
+The interesting method here is snapshot. A sandbox session can be frozen and restored later from a handle. That matters for a week long run, because it means the working environment itself, not just the git state, can be paused and brought back after a crash or a long sleep. We saw a sandbox.restore line in the trace earlier when the host rebooted. With tools gated and sandboxed, we can let the model act. But acting is not the same as succeeding. For that we need the gate that decides what counts as done.
+
+Deterministic Verification
+
+This is the most important section in the blog, so I want to slow down. Over thousands of steps, small errors compound. If each step is ninety nine percent reliable, then after a few hundred steps you are almost certainly broken. The only way to stop this compounding is to never trust the model’s own claim that something works. We trust a real test instead.
+
+The Exit Code Decides
+
+The DeterministicVerifier runs each check as a real subprocess and looks at its exit code. An item is done only when every gating check exits zero. Not when the model says so. When the exit code says so.
+
+Press enter or click to view image in full size
+Only real exit codes, not the model’s opinion, can flip an item to done (Created by Fareed Khan)
+# src/lra/verify/verifier.py
+
+class DeterministicVerifier:
+    async def verify(self, workdir: str, checks: list[Check]) -> VerificationResult:
+        results: list[CheckResult] = []
+        for check in checks:
+            outcome = await run_proc(check.command, cwd=workdir, timeout_s=self._timeout)
+            results.append(
+                CheckResult(name=check.name, passed=outcome.ok, exit_code=outcome.exit_code)
+            )
+        # The gate: EVERY gating check must pass. Advisory checks are recorded, not gating.
+        all_green = all(
+            result.passed
+            for check, result in zip(checks, results, strict=True)
+            if check.gating
+        )
+        return VerificationResult(all_green=all_green, results=results)
+
+The default gate for a Python project is three real commands, and you have seen them in the trace already.
+
+def default_python_checks() -> list[Check]:
+    return [
+        Check(name=\"ruff\", command=[\"uv\", \"run\", \"ruff\", \"check\", \".\"]),
+        Check(name=\"mypy\", command=[\"uv\", \"run\", \"mypy\"]),
+        Check(name=\"pytest\", command=[\"uv\", \"run\", \"pytest\", \"-q\"]),
+    ]
+
+Back in the agent loop, the result of this verifier is the only thing that decides the item’s fate. If all_green is true, the item becomes done and its verified_by is filled with the check names. If not, the item becomes blocked and the attempt counter goes up. Here is the moment in the trace when the transport bug we have been following finally passes.
+
+#### OUTPUT ####
+09:10:21 INFO  tool.exec cycle=c201 name=run_command cmd=\"uv run pytest tests/test_framing.py -q\" -> exit=0
+    collected 7 items
+    tests/test_framing.py .......                                            [100%]
+    7 passed in 0.13s
+09:10:21 INFO  verify.ok cycle=c201 checks=[pytest]   <- FIRST GREEN (cycle 201, ~2.5 days in)
+09:11:02 INFO  git.commit head=a1f2e3d msg=\"lra: transport framing (isolated, byte-tested)\"
+
+Exit code zero, seven tests passed, and only then does the verifier say verify.ok. That is the first green of the whole task, and it arrived on cycle 201, about two and a half days in. The commit that follows it is the first piece of truly trustworthy progress. Everything before it was attempts.
+
+Trusting the Gate
+
+There is a subtle trap here. Green only means correct if the tests actually exercise the code. A repo with no tests is green and also worthless. So before we lean hard on the gate, and especially before we let parallel writers loose, we measure how much we can trust it. We use two numbers, coverage and mutation score.
+
+Press enter or click to view image in full size
+Coverage and mutation score decide how far to trust the verification gate (Created by Fareed Khan)
+# src/lra/verify/trust_bootstrap.py
+
+class TrustBootstrap:
+    def __init__(self, *, coverage_threshold: float = 0.6, timeout_s: int = 900) -> None:
+        self._threshold = coverage_threshold
+
+    async def measure(self, workdir: str, *, command=None) -> \"VerifierTrust\":
+        cmd = command or [\"uv\", \"run\", \"pytest\", \"--cov\", \"--cov-report=term-missing\", \"-q\"]
+        result = await run_proc(cmd, cwd=workdir, timeout_s=self._timeout)
+        combined = f\"{result.stdout}\
+{result.stderr}\"
+        pct = parse_coverage_pct(combined)
+        return VerifierTrust(coverage_pct=pct, trusted=pct >= self._threshold, raw_tail=combined[-2000:])
+
+Coverage tells us which lines ran. Mutation testing goes further. It deliberately introduces bugs into the code and checks whether the tests catch them. A high mutation score is the strongest evidence that the gate would actually notice a regression. Here is the mutation run from late in the LSP task.
+
+#### OUTPUT ####
+09:36:02 INFO  run_command cmd=\"uv run pytest --cov -q\"  -> exit=0  \"coverage: 91%\"
+09:48:55 INFO  run_command cmd=\"uv run mutmut run\"       -> exit=0  \"killed 89/106 (score 0.84)\"
+09:49:00 INFO  gate.trusted coverage=0.91 mutation=0.84
+
+Ninety one percent coverage, and the tests killed eighty nine of one hundred and six mutants for a score of 0.84. At that point the system logs gate.trusted, which is its way of saying the green checkmark now means something. This is what earns the right to trust the gate.
+
+Flaky Quarantine
+
+One last verification problem. A flaky test, one that passes and fails at random, poisons the gate. If a flaky check can block progress, then green becomes unreliable and the agent wastes cycles chasing ghosts. So we quarantine known flaky checks. They still run, for visibility, but they are forced to be non-gating.
+
+Press enter or click to view image in full size
+Flaky checks still run for visibility but are forced non-gating (Created by Fareed Khan)
+# src/lra/verify/flaky_quarantine.py
+
+class FlakyQuarantine:
+    def __init__(self) -> None:
+        self._flaky: set[str] = set()
+
+    def mark_flaky(self, name: str) -> None:
+        self._flaky.add(name)
+
+    def partition(self, checks: list[Check]) -> tuple[list[Check], list[Check]]:
+        \"\"\"Split into (gating, quarantined); quarantined checks are forced non-gating.\"\"\"
+        gating, quarantined = [], []
+        for check in checks:
+            if check.name in self._flaky:
+                quarantined.append(check.model_copy(update={\"gating\": False}))
+            else:
+                gating.append(check)
+        return gating, quarantined
+
+A quarantined check is copied with gating=False, so it can never block an item, but it still runs so we can track its flake rate over time. This keeps the meaning of green clean. We now have a complete inner engine. It reads truth, acts through gated tools in a sandbox, and only marks progress when a trustworthy test passes. The next problem is making that engine survive for a week.
+
+The Durable Backbone
+
+The inner loop is good, but on its own it is still just a Python process. If that process dies, the loop dies with it. To run for a week, we wrap the loop in a durable execution engine. We use Temporal. The idea of Temporal is that your control flow is split into two kinds of code. There is workflow code, which must be deterministic and is journaled so it can be replayed, and there is activity code, which does all the messy non deterministic work and whose results are recorded once and then served from a cache on replay. This split is what gives us crash recovery for free.
+
+The Deterministic Scheduler
+
+The MissionWorkflow is the scheduler, and it is deliberately tiny and boring. It contains no model calls, no file IO, and no randomness. All it does is dispatch one cycle activity at a time and count how many have run.
+
+Press enter or click to view image in full size
+The MissionWorkflow is a deterministic scheduler that dispatches one activity per cycle (Created by Fareed Khan)
+# src/lra/durable/workflows.py
+
+@workflow.defn
+class MissionWorkflow:
+    @workflow.run
+    async def run(self, inp: MissionInput, state: MissionState | None = None) -> MissionResult:
+        state = state or MissionState()
+        self._cycles_done = state.cycles_done
+
+        while True:
+            if state.cycles_done >= inp.max_cycles:
+                return await self._terminal(inp, state, completed=False)
+
+            # The ONE activity per loop. All real work happens inside it.
+            result = await workflow.execute_activity(
+                run_agent_cycle,
+                CycleInput(
+                    mission_id=inp.mission_id, workdir=inp.workdir,
+                    cycle_id=f\"c{state.cycles_done + 1}\", check_commands=inp.check_commands,
+                ),
+                start_to_close_timeout=timedelta(minutes=10),
+                retry_policy=_CYCLE_RETRY,           # up to 10 tries, exponential backoff
+            )
+            state.cycles_done += 1
+            self._cycles_done = state.cycles_done
+
+            if result.is_complete:
+                return MissionResult(mission_id=inp.mission_id, completed=True,
+                                     cycles=state.cycles_done, head_sha=result.head_sha,
+                                     items_done=result.items_done, items_total=result.items_total)
+
+            if state.cycles_done % inp.cycles_before_can == 0:
+                workflow.continue_as_new(args=[inp, state])    # bound history (see below)
+
+That is the entire scheduler. Read it and notice what is not there. There is no business logic. The workflow only decides when to run the next cycle and when to stop. Because the workflow is deterministic, Temporal can replay its history at any time and arrive at the exact same state. The retry policy means that if a cycle activity fails, Temporal retries it up to ten times with backoff before giving up. The real intelligence is all inside that one activity.
+
+Journaled Activities and Replay
+
+The activity is where everything non deterministic lives. It runs the real AgentLoop we built earlier. The crucial property is that it is idempotent. It always reads fresh state from git and advances the next actionable item, so running it twice is safe.
+
+Press enter or click to view image in full size
+A crash triggers replay; completed activities come from cache so no work is redone (Created by Fareed Khan)
+# src/lra/durable/activities.py
+
+async def _execute_cycle(inp: CycleInput) -> CycleResult:
+    \"\"\"Advance the mission by one verified item via the real agent loop; idempotent.\"\"\"
+    anchor = GitMissionAnchor(inp.workdir)
+    snapshot = await anchor.read_situational_awareness()   # always read truth first
+
+    if snapshot.is_complete or snapshot.active_item is None:
+        # Already done: returning early is what makes a retry a safe no-op.
+        checklist = await anchor.read_checklist()
+        done = sum(1 for i in checklist.items if i.status == \"done\")
+        return CycleResult(item_id=None, advanced=False, head_sha=snapshot.head_sha,
+                           is_complete=True, items_done=done, items_total=len(checklist.items),
+                           note=\"nothing actionable\")
+
+    session = await LocalSandbox().open(workdir=inp.workdir)
+    loop = AgentLoop(model=build_provider(), dispatcher=AllowListDispatcher(default_local_tools()),
+                     verifier=DeterministicVerifier(), anchor=anchor)
+    # ... run one cycle, then return a small CycleResult that Temporal journals ...
+
+Now watch what happens when the host reboots in the middle of a run. This is from the LSP trace, on day three, when a host OS update rebooted the machine mid cycle.
+
+#### OUTPUT ####
+13:48:12 ERROR worker.disconnect reason=\"connection reset (host OS update reboot)\" inflight_cycle=c190
+13:55:40 WARN  temporal.replay wf=mission:mission_4c7e21a9 events=631 (completed activities served from cache; 0 tokens re-spent; 0 double commits)
+13:55:41 INFO  reconcile.in_flight ticket=01 branch=feat/transport -> adopt (branch present, unmerged)
+13:55:42 DEBUG orchestrator.note \"replay restored state EXACTLY -> a still-RED transport. durability protects WORK, not CORRECTNESS.\"
+
+This is the durability guarantee made visible. The worker died, a new one started, and Temporal replayed six hundred and thirty one events. Every activity that had already completed was served from the cache, so zero tokens were re-spent and zero commits were duplicated. The task resumed at the exact cycle it was on. I love that last line in the trace.
+
+Durability protects the work, not the correctness. The replay brought back a transport that was still failing its test, because that was the true state. The system does not pretend a broken thing is fixed. It just refuses to lose progress.
+
+Durable Sleep and Continue-As-New
+
+Two more tricks make the week long part actually work. The first is durable sleep. When there is nothing to do, for example overnight, the workflow sleeps on a durable timer. This costs nothing and survives reboots. The second is Continue-As-New. A week long run would otherwise pile up a gigantic event history, so every so many cycles the workflow rolls over into a fresh execution, carrying only a tiny compact state.
+
+Press enter or click to view image in full size
+Durable sleep costs nothing and Continue-As-New keeps the event history bounded (Created by Fareed Khan)
+# inside MissionWorkflow.run, the rollover line again:
+if state.cycles_done % inp.cycles_before_can == 0:
+    # Start a fresh execution carrying only the compact MissionState (pointers),
+    # never the history. The new run replays prior cycles from the activity cache.
+    workflow.continue_as_new(args=[inp, state])
+
+The MissionState that gets carried over is just a counter, cycles_done. Everything else is in git. So the rollover is cheap, and the new execution starts with a clean, small history. Here is what a quiet end of day looks like in the trace.
+
+#### OUTPUT ####
+18:32:04 INFO  sleep.durable until=2026-05-27T07:30:00Z reason=idle-eod
+18:32:04 INFO  consolidate episodes=12 facts=5 ; governor.tick cum_usd=0.094
+...
+07:30:00 INFO  wake active=01 reground=git+anchor dur=0.041s
+
+The task slept from the evening until the next morning at zero cost, then woke up and reground itself from git in forty one milliseconds. That reground step is just our read_situational_awareness from earlier. The agent goes to sleep, the world turns, and it wakes up knowing exactly where it was. This is what a week of wall clock time looks like when most of it is spent sleeping.
+
+The Claim-Check Codec
+
+Over a week, the workflow journals thousands of steps, and some payloads are large, like a big model response or a long test log. If we journaled those raw, Temporal’s history would balloon. So we use the claim-check pattern. Any payload over a threshold is stored in an object store, and only a short content addressed key goes into the journal.
+
+Press enter or click to view image in full size
+Large payloads go to an object store and only a short key is journaled (Created by Fareed Khan)
+# src/lra/durable/codec.py
+
+class ClaimCheckCodec(PayloadCodec):
+    async def encode(self, payloads):
+        encoded = []
+        for payload in payloads:
+            if len(payload.data) > self._threshold:        # default 32 KiB
+                key = await self._store.put(payload.data)   # store the bytes...
+                encoded.append(Payload(
+                    metadata={\"encoding\": _CLAIMCHECK_ENCODING,
+                              \"lra-orig-encoding\": payload.metadata.get(\"encoding\", b\"\")},
+                    data=key.encode(\"utf-8\"),               # ...journal only the key
+                ))
+            else:
+                encoded.append(payload)
+        return encoded
+
+The object store keys are SHA256 hashes of the content, so identical payloads are stored once automatically. A ten megabyte response becomes a sixty four character hash in the history. You can see this in the very first line of the trace, where the data converter is configured with a claim-check threshold.
+
+#### OUTPUT ####
+09:00:01 INFO  temporal.connect addr=localhost:7233 ns=default build_id=lra-7f1c
+               data_converter=ClaimCheckCodec(threshold=32768)
+
+The codec is wired in at the data converter level, so the activity code never knows it is happening. It just passes objects around, and large ones are transparently offloaded. This is what keeps the journal small enough to replay quickly even after a week of work.
+
+Sagas and Compensation
+
+The last durability piece is for actions that reach outside our git repo, like creating a branch, opening a pull request, or merging. These are multi step, and a failure halfway through leaves a mess. So each forward step registers an undo action before it runs, and on failure we run the undos in reverse order.
+
+Press enter or click to view image in full size
+Each forward step registers an undo; on failure they run newest-first (Created by Fareed Khan)
+# src/lra/durable/saga.py
+
+class Saga:
+    def add(self, name: str, undo: Callable[[], Awaitable[None]]) -> None:
+        self._compensations.append(Compensation(name=name, undo=undo))
+
+    async def compensate(self) -> list[str]:
+        \"\"\"Run compensations newest-first (LIFO); record any undo failures, never stop.\"\"\"
+        ran = []
+        for comp in reversed(self._compensations):
+            try:
+                await comp.undo()
+                ran.append(comp.name)
+            except Exception as exc:
+                self.failures.append(f\"{comp.name}: {type(exc).__name__}: {exc}\")
+        return ran
+
+So if we create a branch and open a pull request and then the merge fails, the saga closes the pull request and deletes the branch, in that order. One caveat. A truly irreversible action, like a production deploy, is not pretend rolled back. Instead it routes to a human gate, which we will cover soon. With the durable backbone in place, our single agent can now run for weeks. The next question is whether one agent is even the right shape.
+
+The Uneven Team
+
+Up to now there has been one agent doing everything. The obvious next idea is to throw a swarm of agents at the problem. I want to push back on that, because more agents is not automatically better. More agents is a cost, and we should only pay it where it actually buys something.
+
+Why Multi-Agent Is a Cost
+
+When several agents write code at the same time, they make conflicting assumptions, they step on each other’s files, and the design loses coherence. Parallelism helps for work that is genuinely independent, like reading different parts of a codebase or reviewing finished work with fresh eyes. It hurts for coupled writing, where every decision depends on the last. So the team is uneven on purpose.
+
+Press enter or click to view image in full size
+One lead writes; researchers and a reviewer fan out only for independent work (Created by Fareed Khan)
+
+The shape is this. One single threaded lead engineer owns all the coupled code writing, so design decisions stay coherent. Ephemeral helpers fan out only for the two things that truly parallelize. Researchers read in parallel, and a reviewer checks the work with a fresh context. A separate integrator is the only one allowed to write to the main branch. This is not a swarm. It is a small, deliberate team where the expensive part, coherent writing, stays serial.
+
+Roles and Model Tiers
+
+Every role is described by a small spec that says which model tier it uses and what it is allowed to do. This is where cost discipline lives. We spend the expensive Opus model only on high leverage judgment, and we use cheap models for bulk search.
+
+Press enter or click to view image in full size
+Roles map to model tiers so cost is proportional to the value of the judgment (Created by Fareed Khan)
+# src/lra/agents/roles.py
+
+class RoleSpec(BaseModel):
+    name: str
+    tier: ModelTier             # OPUS | SONNET | HAIKU
+    system_prompt: str
+    allow_mutating: bool = False
+    allow_egress: bool = False
+    max_turns: int = 8
+
+
+# the lead is the only role that writes the integration line:
+\"lead\": RoleSpec(
+    name=\"lead\",
+    tier=ModelTier.OPUS,
+    system_prompt=(
+        \"You are the Lead Engineer and the SOLE writer to the integration line. Keep design \"
+        \"decisions coherent. Mark an item done only when the deterministic checks are green.\"
+    ),
+    allow_mutating=True,
+),
+
+Here is how the tiers map to roles. The high judgment roles get the strongest model, and the cheap, parallel work gets a small one.
+
+The planner, the lead, and the reviewer use Opus, because their judgment shapes everything.
+The integrator and the tester use Sonnet, for mid weight work.
+The researcher uses Haiku, because reading and summarizing is cheap and runs many times.
+
+This makes the cost of the whole team proportional to the value of the decision, not to the amount of computation. A researcher that runs fifty times costs almost nothing, while the lead that makes the coherent design choices gets the model that is worth paying for.
+
+The Planner
+
+A task starts with the planner. It takes the task description and turns it into a checklist of small, ordered, independently verifiable steps. It asks the model for a JSON array and then parses it defensively, because models do not always return clean JSON.
+
+Press enter or click to view image in full size
+The planner decomposes the task into an ordered, verifiable checklist (Created by Fareed Khan)
+# src/lra/agents/planner.py
+
+class Planner:
+    async def plan(self, *, title: str, description: str, acceptance: str = \"\") -> Checklist:
+        messages = [
+            ModelMessage(role=\"system\", content=ROLES[\"planner\"].system_prompt),
+            ModelMessage(role=\"user\", content=(
+                f\"Mission: {title}\
+\
+{description}\
+\
+\"
+                f\"Definition of done: {acceptance or '(use your judgment)'}\
+\
+\"
+                f\"{_PLANNER_INSTRUCTIONS}\")),
+        ]
+        result = await self._model.complete(messages)
+        items = parse_checklist(result.text)
+        if not items:
+            # Never fail to produce a plan; degrade to a single item.
+            items = [ChecklistItem(id=\"01\", description=description.strip() or title.strip())]
+        return Checklist(items=items)
+
+The fallback at the end matters. If the model returns garbage, we do not crash. We make a one item checklist from the description, so a task can always start. Here is the planner at work on the LSP task, and I want you to notice something uncomfortable in the output.
+
+#### OUTPUT ####
+09:47:55 INFO  checklist.write items=31 sha256=4b1c... (01 transport, 02 init, 03 hover,
+               04 completion, 05 definition, 06 diagnostics, 07 formatting, 08 documentSymbol, 09 rename, ...)
+09:47:55 INFO  ownership.map lead=[transport,dispatch,index] implementers=[per-feature]
+
+The planner produced thirty one items. That turns out to be too many. Planning the full server before the core even works is the seed of a multi day wasted effort that we will watch unfold later. The planner is powerful, but it can also over reach, and the system will need other mechanisms to catch that. That is a good lesson on its own. A plan is a hypothesis, not a contract.
+
+Single-Writer-Per-File Ownership
+
+When we do allow parallel implementers, we prevent collisions with one simple invariant. Every file has exactly one writer. The planner assigns files to writers, and certain shared files, like build manifests and __init__.py, can only ever belong to the lead.
+
+Press enter or click to view image in full size
+Every file has one writer; shared files always belong to the lead (Created by Fareed Khan)
+# src/lra/coordination/ownership.py
+
+class FileOwnershipMap(BaseModel):
+    owners: dict[str, str] = Field(default_factory=dict)   # path -> writer id
+
+    def permits(self, *, writer: str, path: str) -> bool:
+        \"\"\"Whether `writer` may write `path` under the single-writer-per-file invariant.\"\"\"
+        norm = _normalize(path)
+        if is_shared(norm):
+            return writer == LEAD               # shared files are always the lead's
+        owner = self.owners.get(norm)
+        if owner is None:
+            return writer == LEAD               # unassigned space belongs to the serial lead
+        return writer == owner
+
+The rule is easy to state. If a file is shared, only the lead may write it. If a file is owned, only its owner may write it. Anything unassigned defaults to the lead. This is checked at the git layer, so a stray write fails loudly instead of silently corrupting another implementer’s slice. A writer that discovers it needs a file it does not own files a lease request rather than just writing. This is how parallel writing stays safe, on the rare occasions we allow it.
+
+Researcher Fan-Out
+
+Reading is the work that parallelizes beautifully, because it has no side effects. When the lead needs context, the orchestrator fans out several researchers at once, each on a different question, and collects their briefs.
+
+Press enter or click to view image in full size
+Researchers run in parallel and return read-only briefs to the lead (Created by Fareed Khan)
+# src/lra/agents/team.py
+
+async def research_fanout(*, model, dispatcher, ctx, queries, role=None) -> list[SubAgentResult]:
+    \"\"\"Investigate `queries` in parallel; return one brief per query (failures filtered out).\"\"\"
+    role = role or ROLES[\"researcher\"]
+    agents = [SubAgent(role=role, model=model, dispatcher=dispatcher) for _ in queries]
+    results = await asyncio.gather(
+        *(agent.run(objective=q, ctx=ctx) for agent, q in zip(agents, queries, strict=True)),
+        return_exceptions=True,
+    )
+    return [r for r in results if isinstance(r, SubAgentResult)]   # keep the successes
+
+The researchers are read only, so they get a dispatcher with mutation disabled. They run concurrently, and any that fail are simply dropped from the results. On day zero of the LSP task, the lead did not know the wire format of the protocol, so it spent its first move on research instead of guessing.
+
+#### OUTPUT ####
+09:00:08 INFO  research.fanout n=4 task_queue=lra-research rule_of_two=ok caps=2
+09:00:20 INFO  research.brief id=1 \"FRAME ON BYTES. Content-Length = len(utf8(body)). headers ASCII + CRLF;
+               body=utf-8 JSON-RPC 2.0. POSITIONS: 'character' is UTF-16 CODE UNITS (HAZARD-1).\"
+09:00:36 INFO  research.brief id=2 \"pygls: read header lines off sys.stdin.BUFFER until blank; read(n) EXACTLY;
+               write to sys.stdout.BUFFER. NEVER print()/input(). pylsp setmode(O_BINARY) on Windows.\"
+
+Four researchers ran in parallel and came back with crisp briefs. Brief one even flagged a hazard that does not bite until days later, the UTF-16 column encoding. This is the benefit of cheap parallel reading. For a few cents of Haiku tokens, the lead starts the real work already knowing the shape of the problem. The research did not write a single line of code. It just gathered truth.
+
+The Fresh-Context Reviewer
+
+The second thing that parallelizes is review. The trap with a single agent is author bias. The agent that wrote the code is the worst judge of it. So the reviewer is a separate agent with a fresh context. It sees only the diff and the acceptance criteria, never the lead’s reasoning or its earlier attempts.
+
+Press enter or click to view image in full size
+The reviewer sees only the diff with fresh eyes, so it catches what the author missed (Created by Fareed Khan)
+# src/lra/agents/reviewer.py
+
+class Reviewer:
+    async def review(self, *, diff: str, criteria: str, ctx: ToolContext) -> ReviewResult:
+        result = await self._agent.run(
+            objective=(\"Review the diff against the acceptance criteria. Identify correctness, \"
+                       \"security, and scope issues. Prefix any blocking issue with 'BLOCK:'.\"),
+            ctx=ctx,
+            extra_context=f\"Acceptance criteria: {criteria}\
+\
+DIFF:\
+{diff[:8000]}\",
+        )
+        blocking = \"block:\" in result.brief.lower() or \"blocking\" in result.brief.lower()
+        return ReviewResult(brief=result.brief, blocking=blocking, tool_calls=result.tool_calls)
+
+The fresh context is the main idea. Because the reviewer never saw the struggle, it is not invested in the chosen approach. When the LSP task got stuck on the transport for days, it was the reviewer that finally named the real problem.
+
+#### OUTPUT ####
+10:15:40 INFO  reviewer.finding sev=blocking kind=architecture
+    \"you are solving THREE problems in one file and they keep colliding: (1) framing,
+     (2) text-vs-binary streams, (3) concurrency. SEPARATE them. Make framing a pure byte-level
+     pair read_message/write_message and UNIT-TEST it in isolation. Use sys.std*.buffer only.
+     A minimal server needs NO concurrency: a synchronous read->dispatch->write loop.\"
+10:15:40 INFO  reviewer.finding sev=advisory kind=scope
+    \"a broken core + 31 planned items is the real problem; cut scope until the core is green.\"
+
+That single review unstuck the entire task. The lead had been thrashing because it was tangling three problems together. The reviewer, with no attachment to any of the twelve failed attempts, saw it immediately and said to separate them and cut scope. A blocking finding pauses the work and forces a rethink. This is the clearest example in the whole run of why an independent set of eyes is worth paying for.
+
+The Decision Log
+
+We met the decision record earlier as a data type. Here is how it is used in practice. Every meaningful design decision is appended to a log that is never compacted, so later work can be checked against it.
+
+Press enter or click to view image in full size
+Design decisions are appended to a never-compacted log to catch contradictions (Created by Fareed Khan)
+# src/lra/coordination/decision_log.py
+
+class DecisionLog:
+    \"\"\"A JSONL file of DecisionRecords. Append-only; never rewritten.\"\"\"
+
+    def append(self, record: DecisionRecord) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open(\"a\", encoding=\"utf-8\") as fh:
+            fh.write(record.model_dump_json() + \"\
+\")
+
+    def read(self) -> list[DecisionRecord]:
+        if not self._path.exists():
+            return []
+        lines = [ln for ln in self._path.read_text(encoding=\"utf-8\").splitlines() if ln.strip()]
+        return [DecisionRecord.model_validate_json(ln) for ln in lines]
+
+After the reviewer’s intervention, the decisions for the LSP task read like a clear story of how the approach changed.
+
+#### OUTPUT ####
+07:31:02 INFO  decisions.append id=3 \"narrow->14; transport-first TDD; SYNC loop; binary streams (sys.*.buffer)\"
+
+That one line records the turning point. The task narrowed from thirty one items to fourteen, committed to test driven development for the transport first, and chose a synchronous loop with binary streams. Because this is written down and never compacted, no future cycle can quietly drift back to the tangled async approach. The decision log is the team’s long term memory of why, not just what.
+
+Staying Safe and On Budget
+
+An agent that runs for a week and can write code, run commands, and reach the network is powerful, and powerful things need guardrails. This section is about the guardrails that keep a long run from quietly burning money, spinning forever, or doing something dangerous. None of these live in a prompt. They all live in code that the model cannot talk its way around.
+
+The Budget Governor
+
+The first guardrail is money. The governor refuses the next cycle before it runs if the projected spend would breach the ceiling. It does not wait until you are over budget. It predicts the next step’s cost from the running average and stops in advance.
+
+Press enter or click to view image in full size
+The governor refuses the next cycle before it runs if it would breach the ceiling (Created by Fareed Khan)
+# src/lra/governor/governor.py
+
+class BudgetGovernor:
+    \"\"\"Refuses the next step BEFORE it runs if it would breach the spend/iteration ceiling.\"\"\"
+
+    def authorize_next(self, ledger, *, cycles_done, projected_usd=None) -> GovernorDecision:
+        spent = ledger.total_usd
+        # Estimate the next step from history if no explicit projection was given.
+        estimate = projected_usd if projected_usd is not None else ledger.mean_usd_per_cycle()
+        projected_total = spent + estimate
+
+        if cycles_done >= self._max_cycles:
+            return self._deny(\"max cycles reached\", projected_total, spent)
+        if projected_total > self._ceiling:
+            return self._deny(\"projected spend exceeds ceiling\", projected_total, spent)
+        return GovernorDecision(allow=True, reason=\"within budget\",
+                                projected_usd=projected_total, spent_usd=spent,
+                                ceiling_usd=self._ceiling)
+
+The agent loop calls authorize_next at the top of every cycle, and if the decision is not allow, the task stops cleanly rather than overspending. Here is the governor authorizing a cycle and then ticking the running total later in the run.
+
+#### OUTPUT ####
+07:30:01 INFO  governor.authorize cycle=c1 allow=true projected_usd=0.06 spent=0.094
+...
+17:48:02 INFO  governor.tick cum_usd=31.29 tests=0/1 active=01 cycles_today=1 attempts=12
+
+The first line shows a cycle being authorized because the projected total is well under the ceiling. The second line, much later, shows the cumulative spend at 31 dollars and 29 cents after a hard day of failed attempts on the transport. The governor never had to intervene on this task, because it finished at 178 dollars against a 400 dollar ceiling, but it is the reason a stuck task cannot silently run up a thousand dollar bill.
+
+The Loop Detector
+
+The second guardrail is time. An agent can get stuck retrying the same failing thing over and over. The loop detector watches for the same state and action signature recurring, and after a threshold it trips and escalates.
+
+Press enter or click to view image in full size
+The loop detector trips when the same state and action repeats too often (Created by Fareed Khan)
+# src/lra/governor/governor.py
+
+class LoopDetector:
+    \"\"\"Flags oscillation: the same (state, action) signature recurring too often.\"\"\"
+
+    def __init__(self, *, threshold: int = 3) -> None:
+        self._threshold = threshold
+        self._counts: Counter[str] = Counter()
+
+    def observe(self, signature: str) -> bool:
+        \"\"\"Record a signature; return True once it has looped past the threshold.\"\"\"
+        self._counts[signature] += 1
+        return self._counts[signature] >= self._threshold
+
+This is exactly what saved the LSP task from grinding forever on the transport. After the same kind of edit kept failing, the detector first warned, then tripped, and the work was escalated to the reviewer we met earlier.
+
+#### OUTPUT ####
+17:48:02 WARN  loop_detector signature=\"01:transport:edit\" count=3 action=warn
+...
+10:15:09 ERROR loop_detector signature=\"01:transport:rewrite\" count=4 action=TRIP
+10:15:09 INFO  orchestrator.pause item=01 ; escalate=reviewer reason=loop-trip
+
+The signature 01:transport:rewrite recurred four times, the detector tripped, and instead of letting the lead keep failing, the orchestrator paused the item and called in the reviewer. That escalation is what produced the architecture finding that unstuck everything. The loop detector did not fix the bug. It noticed that the agent could not fix it alone, and asked for help.
+
+Default-Deny Egress
+
+Now the dangerous part, the network. The egress policy is default deny. No host is reachable unless it is explicitly on an allow list. And the agent never holds real credentials. It only ever sees placeholders, and a broker swaps in the real secret at the very last moment, at the egress boundary.
+
+Press enter or click to view image in full size
+Egress is default-deny and a broker injects real secrets only at the boundary (Created by Fareed Khan)
+# src/lra/safety/egress.py
+
+class EgressPolicy(BaseModel):
+    \"\"\"Allow-list of permitted egress hosts (default-deny: empty = nothing allowed).\"\"\"
+
+    allow_hosts: set[str] = Field(default_factory=set)
+
+    def permits(self, url: str) -> bool:
+        host = urlparse(url).hostname
+        return host is not None and host in self.allow_hosts
+
+
+class CredentialBroker:
+    \"\"\"Maps placeholder tokens to real secrets, injected only at egress.\"\"\"
+
+    def resolve(self, value: str) -> str:
+        for placeholder, secret in self._secrets.items():
+            value = value.replace(placeholder, secret)   # swap at the boundary only
+        return value
+
+The benefit is concrete. If the agent is somehow hijacked by a malicious web page it reads, the worst it can leak is a useless placeholder string, because the real secret never enters its context. And it can only reach hosts we approved. In the trace, every fetch records the egress decision next to it.
+
+#### OUTPUT ####
+09:00:12 INFO  tool.exec agent=researcher-1 name=web_fetch
+               url=microsoft.github.io/.../specification/#headerPart -> 200 egress=allow(microsoft.github.io)
+
+The fetch succeeded and the log shows egress=allow(microsoft.github.io), which means that host was on the allow list. A request to any host not on the list would have been refused by the policy before it ever left the machine. Network access is a privilege the agent is granted narrowly, not a default it has.
+
+The Rule of Two
+
+There is a deeper safety idea here, and it is structural rather than a single check. Meta named it the rule of two. There are three dangerous capabilities. Ingesting untrusted content, having access to private data, and being able to communicate externally. Holding all three at once is the dangerous combination that makes prompt injection catastrophic. So a single session is allowed at most two of the three.
+
+Press enter or click to view image in full size
+A session may hold at most two of untrusted content, private data, and external comms (Created by Fareed Khan)
+# src/lra/safety/rule_of_two.py
+
+class Capability(str, Enum):
+    UNTRUSTED_CONTENT = \"untrusted_content\"   # web pages, issue text, ...
+    PRIVATE_DATA = \"private_data\"             # secrets, customer data
+    EXTERNAL_COMMS = \"external_comms\"         # egress / side effects
+
+
+def check_rule_of_two(capabilities: set[Capability]) -> None:
+    \"\"\"Raise if a session would hold the full lethal trifecta (all three at once).\"\"\"
+    if len(capabilities) >= 3:
+        raise RuleOfTwoViolation(
+            \"session would hold untrusted content + private data + external comms \"
+            \"(the lethal trifecta); split capabilities across sessions\"
+        )
+
+The orchestrator checks this before it grants a session its capabilities. If a piece of work would need all three, it is split across separate sessions instead. You saw the proof for this in the research fan-out trace, where the line read rule_of_two=ok caps=2. The researchers could read untrusted web content and reach the network, which is two capabilities, but they had no access to private data. The system enforced the limit before letting them run. This is safety by structure, not by hoping the model behaves.
+
+Human-in-the-Loop Gates
+
+Some actions are too risky to ever take automatically, like merging to a protected branch or deploying. For those, the system pauses and asks a human. The gate is durable, so it can wait for days at zero cost, and crucially it has a timeout with a default action, so an absent human never makes the task hang forever.
+
+Press enter or click to view image in full size
+Irreversible actions pause on a durable gate with a timeout and a default action (Created by Fareed Khan)
+# src/lra/hitl/gate.py
+
+class AutoPolicyGate:
+    \"\"\"Resolves gates by policy alone (no human).\"\"\"
+
+    async def request(self, req: GateRequest) -> GateResolution:
+        if req.risk is RiskTier.REVERSIBLE and self._auto_approve_reversible:
+            return GateResolution(gate_id=req.gate_id, decision=GateDecision.APPROVE,
+                                  resolved_by=\"auto-policy\")
+        # Irreversible and unattended: apply the request's safe default, and mark it defaulted.
+        return GateResolution(gate_id=req.gate_id, decision=req.default_action,
+                              resolved_by=\"default\", defaulted=True)
+
+The durable version of this gate lives in the workflow itself, using a signal. When a human is needed, the workflow sets its status to WAITING_ON_HUMAN and parks on a condition until someone signals a decision or the timeout fires. A representative status query looks like this.
+
+#### OUTPUT ####
+$ uv run lra mission-status mission_4c7e21a9
+status=WAITING_ON_HUMAN cycles=190
+
+$ uv run lra mission-approve mission_4c7e21a9 --decision approve
+sent decision 'approve' to mission mission_4c7e21a9
+
+A healthy parked task shows SLEEPING, but WAITING_ON_HUMAN means a gate is open and a person needs to act. The approve command signals the workflow, and it resumes instantly. If nobody answers before the timeout, the default action fires, which for an irreversible action is to not proceed. So an unattended run is safe by default. It never quietly does the dangerous thing, and it never hangs invisibly either.
+
+Memory That Survives Weeks
+
+We have a system that runs for a week and stays safe. But there is a difference between surviving a week and learning over a week. The saved state gives the agent perfect recall of the current task. Memory gives it something more, the ability to carry lessons across cycles, and eventually across tasks. This is where the system stops just executing and starts improving.
+
+Three Tiers of Memory
+
+We split memory into three tiers, borrowed from how people talk about memory. Episodic memory is what happened, the raw event log. Semantic memory is distilled facts about the code and the domain. Procedural memory is reusable skills, actual verified code with the conditions under which it applies.
+
+Press enter or click to view image in full size
+Memory has three tiers: episodic events, semantic facts, and procedural skills (Created by Fareed Khan)
+# src/lra/contracts/memory.py
+
+class MemoryRecord(BaseModel):
+    id: str
+    kind: str           # \"episodic\" | \"semantic\" | \"procedural\"
+    text: str
+    metadata: dict[str, str] = {}
+    embedding_model: str | None = None
+    embedding_version: str | None = None
+    valid: bool = True  # soft-invalidation; we never hard-delete a memory
+
+
+@runtime_checkable
+class SemanticIndex(Protocol):
+    \"\"\"Stores records and retrieves them by semantic similarity.\"\"\"
+
+    async def add(self, records: list[MemoryRecord]) -> None: ...
+    async def query(self, text: str, *, k: int = 5) -> list[\"RetrievalHit\"]: ...
+
+Notice the valid flag and the embedding_model and embedding_version fields. The valid flag means we never delete a memory outright, we only mark it invalid, which we will come back to. The model and version fields are there to stop a subtle long run bug, comparing vectors that were made by different embedding models. Over weeks, you might change your embedder, and silently mixing vectors from two models gives you garbage retrieval.
+
+Embeddings
+
+To search memory by meaning, we turn text into vectors. The embedder is, of course, another swappable interface. There is a real one that calls a paid semantic API, and a deterministic offline one that costs nothing and is used for tests and local runs.
+
+Press enter or click to view image in full size
+Embeddings come from a swappable embedder, with an offline hash version for $0 runs (Created by Fareed Khan)
+# src/lra/memory/embeddings.py
+
+class HashEmbedder:
+    \"\"\"A deterministic, offline embedder (lexical hashing). For dev/CI/offline only.\"\"\"
+
+    def __init__(self, dim: int = 256) -> None:
+        self.name, self.version, self.dim = \"hash\", \"1\", dim
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_one(text) for text in texts]
+
+    def _embed_one(self, text: str) -> list[float]:
+        vec = [0.0] * self.dim
+        for token in _TOKEN.findall(text.lower()):
+            bucket = int(hashlib.sha1(token.encode(\"utf-8\")).hexdigest(), 16) % self.dim
+            vec[bucket] += 1.0                       # hash each token into a bucket
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]               # normalize to unit length
+
+The hash embedder is not semantic, it is just lexical hashing, but it is deterministic and free, so the entire memory subsystem can run and be tested with no network and no key. In production you swap in the real Voyage embedder behind the same interface. The point, as always, is that the rest of the system does not change.
+
+Hybrid Retrieval
+
+Pure vector search misses exact keyword matches, and pure keyword search misses meaning. So we run both and fuse the rankings. We combine a dense semantic search with a lexical BM25 search using reciprocal rank fusion, which blends two ranked lists without needing their scores to be on the same scale.
+
+Press enter or click to view image in full size
+Dense and lexical search are fused with reciprocal rank fusion, then reranked (Created by Fareed Khan)
+# src/lra/memory/hybrid.py
+
+def reciprocal_rank_fusion(rankings: list[list[str]], *, k: int = 60) -> list[tuple[str, float]]:
+    \"\"\"Fuse ranked id-lists via RRF: score = sum of 1/(k + rank).\"\"\"
+    fused: dict[str, float] = {}
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking, start=1):
+            fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return sorted(fused.items(), key=lambda pair: pair[1], reverse=True)
+
+
+class HybridRetriever:
+    async def query(self, text: str, *, k: int = 5, candidate_k: int = 20) -> list[RetrievalHit]:
+        dense = [h.record.id for h in await self._semantic.query(text, k=candidate_k)]
+        lexical = [doc_id for doc_id, _ in self._bm25.query(text, k=candidate_k)]
+        fused = reciprocal_rank_fusion([dense, lexical])     # blend both rankings
+        # ... map ids back to records and return the top k ...
+
+The fusion is elegant. Each list contributes a score of one over a constant plus the rank, so an item that both methods rank highly floats to the top, while an item only one method found still gets a fair shot. This is the standard two stage retrieval recipe, and it is all pure Python, so it runs at zero cost and is fully deterministic. There is also an optional cross encoder reranker for the final polish, but the noop reranker is the free default.
+
+Consolidation
+
+Episodic events pile up fast. We do not want to keep ten thousand raw events forever. So during the durable sleep windows, a librarian role consolidates recent episodes into a few durable semantic facts. This is the model reflecting on what it did and writing down what is worth keeping.
+
+Press enter or click to view image in full size
+During sleep the librarian distills recent episodes into durable semantic facts (Created by Fareed Khan)
+# src/lra/memory/consolidation.py
+
+async def consolidate(*, model, episodes: list[str], mission_id=None) -> list[MemoryRecord]:
+    \"\"\"Distill `episodes` into semantic MemoryRecord facts (model-driven, safe fallback).\"\"\"
+    if not episodes:
+        return []
+    joined = \"\
+\".join(f\"- {e}\" for e in episodes[-200:])
+    result = await model.complete([
+        ModelMessage(role=\"system\", content=\"You are the Librarian; consolidate memory.\"),
+        ModelMessage(role=\"user\", content=f\"{_INSTRUCTIONS}\
+\
+Episodes:\
+{joined}\"),
+    ])
+    facts = _parse_facts(result.text)
+    if not facts:                                       # deterministic fallback
+        facts = list(dict.fromkeys(episodes))[-10:]     # keep recent distinct episodes
+    return [MemoryRecord(id=new_id(\"fact\"), kind=\"semantic\", text=f, metadata=...) for f in facts]
+
+And forgetting is deliberately conservative. We never let the model rewrite a fact in place, because that risks turning a hallucination into remembered truth. We only mark facts invalid, with a soft invalidate. Here is the consolidation step running after the hardest two days of the LSP task.
+
+#### OUTPUT ####
+07:00:05 INFO  librarian.consolidate window=2d episodes=29 -> lessons=4
+07:00:05 INFO  librarian.lesson L1 \"wire-protocol framing is byte-level + stream-mode-sensitive -> isolate & unit-test FIRST\"
+07:00:05 INFO  librarian.lesson L2 \"never fix 3 entangled problems in one file; split them\"
+07:00:05 INFO  librarian.lesson L3 \"stream.read(n) on a pipe can short-read -> loop until n bytes\"
+
+Overnight, twenty nine raw episodes became four crisp lessons. Read those lessons. They are exactly the painful things the task learned the hard way during the hard part. The next morning, those lessons were in the context when the lead re-planned, which is why the second attempt went so much better. The system slept, reflected, and woke up knowing more.
+
+The Skill Library
+
+The highest tier is procedural memory, an actual library of reusable skills. A skill is code plus the preconditions under which it applies. The critical rule is that a skill is admitted into the library only if it was verified, meaning it passed the deterministic test gate when it was learned.
+
+Press enter or click to view image in full size
+A skill enters the library only after passing the deterministic test gate (Created by Fareed Khan)
+# src/lra/memory/skills.py
+
+class InMemorySkillStore:
+    async def add(self, skill: Skill) -> None:
+        if not skill.verified:
+            raise SkillNotVerifiedError(
+                f\"refusing to admit unverified skill {skill.id!r} (must pass the test gate first)\"
+            )
+        self._by_id[skill.id] = skill
+        await self._index.add([MemoryRecord(
+            id=skill.id, kind=\"procedural\", text=skill.description,
+            metadata={\"namespace\": skill.namespace, \"name\": skill.name},
+        )])
+
+The store flatly refuses to admit an unverified skill. This is what stops the library from filling up with plausible nonsense. A skill also carries provenance and an expiry, so a lesson cannot get stuck forever. Watch the skill gate in the LSP trace, first refusing and then admitting.
+
+#### OUTPUT ####
+18:35:10 INFO  skill.admit count=0 reason=\"nothing passed the gate; the system records no progress it didn't earn\"
+...
+09:11:02 INFO  skill.confirm name=lsp-framing precond=[python,stdio] proven_by=tests/test_framing.py
+11:50:02 INFO  skill.admit name=lsp-utf16-offsets proven_by=tests/test_positions_unicode.py
+
+The first line is my favorite line in the whole run. After a full day of failed attempts, zero skills were admitted, because nothing passed the gate. The system records no progress it did not earn. Then, once the framing finally passed its tests, the skill lsp-framing was confirmed, with the test file that proved it as evidence. Later, the UTF-16 fix earned its own skill. The library only ever contains things that were proven to work. That is what makes a skill safe to reuse on the next task.
+
+Making the Lesson Permanent
+
+The memory we just built helps within a task. But the most interesting kind of learning happens between tasks. After a task ends, the system can look back at its failures and improve its own prompts, so the next task of the same kind goes better. This is self improvement, and it is done very carefully, because letting an agent rewrite its own instructions is dangerous if you do it naively.
+
+Proposing a Better Prompt
+
+The first step happens entirely offline, between tasks, never on a live run. An evolver reads the failure traces from a finished task and proposes an improved system prompt for a role. This is a reflective optimization, in the spirit of GEPA. Importantly, the output is only a candidate. Nothing is changed yet.
+
+Press enter or click to view image in full size
+Offline, the evolver reads failure traces and proposes a candidate prompt (Created by Fareed Khan)
+# src/lra/agents/evolver.py
+
+class PromptEvolver:
+    \"\"\"Proposes an improved prompt for a role from its failure traces (offline).\"\"\"
+
+    async def propose(self, *, role, current_prompt, failure_traces) -> PromptCandidate:
+        traces = \"\
+\".join(f\"- {t}\" for t in failure_traces[-50:]) or \"(no traces)\"
+        result = await self._model.complete([
+            ModelMessage(role=\"system\", content=(
+                \"You optimize an agent's SYSTEM PROMPT by reflecting on its failures \"
+                \"(GEPA-style). Output ONLY the improved prompt text, no preamble.\")),
+            ModelMessage(role=\"user\", content=(
+                f\"Role: {role}\
+\
+Current prompt:\
+{current_prompt}\
+\
+\"
+                f\"Failure traces:\
+{traces}\
+\
+Return an improved prompt.\")),
+        ])
+        candidate = result.text.strip() or current_prompt
+        return PromptCandidate(role=role, prompt=candidate,
+                               rationale=\"reflective optimization over failure traces (eval-gated)\")
+
+The evolver reads what went wrong and writes what it thinks would have gone better. For the LSP task, it noticed that days were lost to a hard wire protocol problem tangled with over scoping, and it proposed standing rules to prevent that next time.
+
+#### OUTPUT ####
+22:14:40 INFO  evolve.candidate diff=\"+ for stdio/wire-protocol: implement+unit-test byte-level framing
+    in ISOLATION first (incl. a short-read stream + a multibyte body); use binary streams; start
+    synchronous. + if an unproven core has >~10 dependent items, cut scope until the core is green.\"
+
+That candidate is the painful week long lesson, compressed into a few standing rules for the lead engineer. But a candidate is just a proposal. We do not trust it yet. It has to earn its place.
+
+The Eval Harness and the Judge
+
+To decide whether a candidate prompt is actually better, we run it against a held out set of gold cases and score the results. The scoring uses an independent agent as a judge, with a rubric, because many of these criteria are fuzzy and not a simple pass or fail.
+
+Press enter or click to view image in full size
+A candidate is scored on gold cases by an independent agent-as-judge (Created by Fareed Khan)
+# src/lra/evals/harness.py
+
+async def run_eval_suite(*, model: ModelProvider, cases: list[EvalCase]) -> EvalReport:
+    \"\"\"Judge each case and aggregate into a report (pass rate + mean score).\"\"\"
+    judge = AgentAsJudge(model)
+    results = []
+    for case in cases:
+        verdict = await judge.judge(candidate=case.candidate, rubric=case.rubric)
+        results.append(EvalCaseResult(name=case.name, passed=verdict.passed,
+                                      score=verdict.score, rationale=verdict.rationale))
+    return EvalReport(results=results)
+
+The judge is deliberately separate from the agents it judges, and it defaults to fail on unparseable output, so it never silently passes something. Here is the eval comparing the old prompt against the evolved one.
+
+#### OUTPUT ####
+22:14:55 INFO  eval.run set=wire-protocol-gold n=20 baseline=0.71 candidate=0.85
+22:15:30 INFO  judge.verdict model=claude-opus-4-8 promote=true delta=+0.14 regressions=0
+
+On twenty gold cases, the baseline prompt scored 0.71 and the evolved prompt scored 0.85. The judge recommends promotion, a gain of 0.14 with zero regressions. Now the candidate has evidence behind it. But we still do not just ship it.
+
+The Promotion Gate
+
+The final gate is the strictest. A candidate is promoted only if it beats the baseline on the evals, and it also has to pass a replay against recorded task histories so we know it does not break determinism, and even then it goes out as a pull request that a human approves. A live agent’s prompt is never hot patched.
+
+Press enter or click to view image in full size
+A candidate is promoted only after evals, a clean replay, and human approval (Created by Fareed Khan)
+# src/lra/agents/evolution.py
+
+async def evolve_and_gate(*, model, role, current_prompt, failure_traces,
+                          baseline_cases, candidate_cases, min_improvement=0.0) -> EvolutionResult:
+    \"\"\"Propose an improved prompt and promote it ONLY if it beats baseline by min_improvement.\"\"\"
+    candidate = await PromptEvolver(model).propose(
+        role=role, current_prompt=current_prompt, failure_traces=failure_traces)
+    baseline = await run_eval_suite(model=model, cases=baseline_cases)
+    evolved = await run_eval_suite(model=model, cases=candidate_cases)
+    promoted = evolved.pass_rate >= baseline.pass_rate + min_improvement
+    return EvolutionResult(promoted=promoted, candidate=candidate,
+                           baseline_pass_rate=baseline.pass_rate,
+                           candidate_pass_rate=evolved.pass_rate,
+                           reason=(\"candidate improved\" if promoted else \"rejected\"))
+
+The gate is a chain of independent checks, the evals, the judge, and a replay. Here is the final promotion step from the trace.
+
+#### OUTPUT ####
+22:15:31 INFO  replay.histories n=9 result=9/9 clean
+22:15:31 INFO  evolve.promote target=prompts/lead.md mode=PR human_approval=required (never hot-patched a live run)
+
+Nine recorded histories replayed cleanly against the new prompt, and only then was the change promoted, as a pull request, with human approval required. The phrase at the end of that line is the whole safety philosophy of self improvement. The system never hot patches a live run. It proposes, it proves, it asks, and only then does the improvement land. The next wire protocol task will skip most of the multi day wasted effort, because the lesson is now baked into the lead’s standing instructions. The loop paid for itself.
+
+A Week in the Life of a Task
+
+We have built every component. Now let us watch them work together over a full week, on the one task I have been quoting from. The task is to build a small Python language server from scratch. A language server speaks a specific wire protocol over standard input and output, which turns out to be a surprisingly nasty little problem. This section is the whole run, start to finish, so you can see how the pieces we built actually behave under real pressure.
+
+Day Zero: Research and Plan
+
+The task starts with a single command. The workflow spins up, the saved state is initialized, and the governor reads its ceiling. Then, instead of guessing at the protocol, the lead does the smart thing and spends its first move on research.
+
+Press enter or click to view image in full size
+Day zero: a research fan-out feeds a plan, which over-scopes to 31 items (Created by Fareed Khan)
+#### OUTPUT ####
+$ uv run lra mission-start --title pylsp-mini --workdir .lra/workspaces/pylsp-mini --task @mission.txt
+09:00:01 INFO  workflow.started wf=mission:mission_4c7e21a9 task_queue=lra-mission
+09:00:01 INFO  governor.config ceiling_usd=400.00 max_cycles=2000 stall_limit=5
+09:00:02 DEBUG planner.thinking \"I do not have the LSP wire format memorised. Guessing will burn cycles.
+               Spend on READ-research first: base protocol framing, a real server's transport, exact JSON.\"
+09:47:55 INFO  checklist.write items=31  (01 transport, 02 init, 03 hover, 04 completion, ...)
+
+The plan came out at thirty one items, which is too many. Planning the whole server before the transport even works is the over scope we flagged earlier, and it is the seed of the wasted effort that follows. But the system does not know that yet. It commits the plan and goes to work. This is realistic. Good engineers over plan too. What matters is whether the system can recover from it, and it can.
+
+The Hard Part
+
+The transport is the first item, and it is brutal. The lead writes a transport, runs the test, and it fails. It tries again, and it fails differently. Over a full day it makes twelve attempts, each one fixing the last symptom and exposing a new one. Bare JSON with no header, then a two byte mismatch from Windows newline translation, then a short read on the pipe, then an asyncio deadlock.
+
+Press enter or click to view image in full size
+Twelve transport attempts, each fixing one symptom and exposing the next (Created by Fareed Khan)
+#### OUTPUT ####
+09:20:38 verify.fail attempt=3 reason=byte-mismatch delta=+2  # Windows \
+ -> \\r\
+ on text-mode stdout
+10:11:40 verify.fail attempt=6 reason=JSONDecodeError \"Unterminated string\"  # pipe short-read
+11:11:02 verify.fail attempt=10 reason=Timeout >12s  # asyncio executor sometimes never returns
+17:48:02 WARN  loop_detector signature=\"01:transport:edit\" count=3 action=warn
+
+Every one of those failures is a real bug that a human would also hit when writing a language server transport on Windows. The important thing is the last line. The loop detector has started counting. The system is noticing that the same item keeps failing in the same way. It does not yet intervene, but it is watching, and that watching is about to matter.
+
+Crash and Replay
+
+On day three, while the transport is still red, the host machine reboots for an OS update, right in the middle of a cycle. This is the disaster that kills a normal agent. Here it is a non event.
+
+Press enter or click to view image in full size
+A mid-cycle reboot is recovered by replay, restoring the exact prior state (Created by Fareed Khan)
+#### OUTPUT ####
+13:48:12 ERROR worker.disconnect reason=\"connection reset (host OS update reboot)\" inflight_cycle=c190
+13:55:40 WARN  temporal.replay events=631 (completed activities served from cache; 0 tokens re-spent; 0 double commits)
+13:55:41 INFO  reconcile.in_flight ticket=01 branch=feat/transport -> adopt (branch present, unmerged)
+13:55:42 DEBUG orchestrator.note \"replay restored state EXACTLY -> a still-RED transport.\"
+
+The worker died and a new one came up. Temporal replayed the journal, served the completed work from cache, and the task continued from the exact cycle it was on. No tokens were re-spent and no commits were duplicated. And notice it restored a still failing transport, because that was the real state. The durable backbone protected the work without pretending the bug was fixed. The task was stuck before the crash, and it is stuck after the crash, which is exactly correct.
+
+Getting Unstuck
+
+What finally breaks the deadlock is not a lucky edit. It is the loop detector tripping, which escalates to the reviewer, which produces the architecture finding we saw earlier. Overnight, the librarian consolidates the failures into lessons. The next morning the planner re-plans with those lessons in context, cuts the scope, and the lead rebuilds the transport as an isolated, tested unit.
+
+Press enter or click to view image in full size
+Lessons plus a reviewer finding drive a re-plan and the first green (Created by Fareed Khan)
+#### OUTPUT ####
+07:00:06 INFO  reflection.write item=01 \"the 12 attempts were the same 3 bugs reshuffled. stop editing
+               transport.py in place; build framing as a tested unit, sync, binary.\"
+07:31:02 INFO  state.migrate checklist v1->v2 items=14 (dropped 06-09, plus 4 sub-items)
+09:10:21 INFO  verify.ok cycle=c201 checks=[pytest]   <- FIRST GREEN (cycle 201, ~2.5 days in)
+
+Read that sequence. The reflection names the real problem, that the twelve attempts were the same three bugs reshuffled. The checklist migrates from thirty one items down to fourteen. And on cycle 201, about two and a half days in, the transport finally passes its tests. That is the first green of the entire task. Everything before it was attempts, and everything after it builds on solid ground. The recovery came from the system’s own machinery, the loop detector, the reviewer, the librarian, and the re-planner, all doing their jobs.
+
+Fan-Out and the Final Gate
+
+Once the core is green, the rest goes fast. The features are independent, so they fan out to parallel implementers. One old hazard, the UTF-16 column encoding that research flagged on day zero, finally bites and is fixed. Then the whole thing runs through the final gate.
+
+Press enter or click to view image in full size
+After the core is green, features fan out, the UTF-16 hazard is fixed, and the final gate passes (Created by Fareed Khan)
+#### OUTPUT ####
+07:30:03 INFO  child.spawn implementer:0 ticket={feature:hover, write_set:[features/hover.py, tests/test_hover.py]}
+07:30:03 INFO  child.spawn implementer:1 ticket={feature:completion, write_set:[features/completion.py, ...]}
+08:58:12 INFO  child.done implementer-0 branch=feat/hover verify=ok skill_reused=lsp-framing
+09:31:45 INFO  reviewer.finding sev=blocking \"HAZARD-1 from day0: LSP 'character' = UTF-16 CODE UNITS;
+               you used Python str indices. convert at the boundary.\"
+08:43:02 INFO  run_command cmd=\"make check\" -> exit=0   \"ruff: clean; mypy: clean; pytest: 58 passed\"
+08:44:51 INFO  mission.complete items=14/14 cycles=615 head=9d8c7b6 status=DONE
+
+There is so much to like in those lines. The implementers ran in parallel on disjoint files, and one of them reused the lsp-framing skill learned during the hard part, so it did not have to rediscover the transport. The reviewer caught the UTF-16 hazard that had been lurking since day zero. And the final gate, make check, passed clean with fifty eight tests green. The task completed all fourteen items in six hundred and fifteen cycles. This is the line we opened the blog with, and now every word of it should make sense.
+
+What Is Proven vs Frontier
+
+It is worth being clear about what this system is and is not, because it is easy to oversell an agent demo. So here is the clean split.
+
+The following parts are proven and tested. They are engineering, and they work today.
+
+Durability and crash recovery. A reboot mid run loses no work and re-spends no tokens.
+State lives outside the model. It is kept in git, so any restart rebuilds the picture in seconds.
+Deterministic verification. Real tests, not the model’s opinion, gate every piece of progress.
+The safety boundaries. The tool gate, default deny egress, the budget governor, and the loop detector are all enforced in code.
+Tiered memory and skill reuse, with skills admitted only after they pass the gate.
+
+And here is the frontier, the part I will not overclaim. Fully hands off, multi week autonomy where a model reliably drives complex work for days without any human is not a solved problem, and no model today does it reliably. The task horizons we can trust are still well under a day at high reliability.
+
+Press enter or click to view image in full size
+What is proven and tested versus what is still the frontier (Created by Fareed Khan)
+
+So the claim of this system is precise. The system runs for weeks. It sleeps, it survives, it resumes, and it never loses track of what it is doing, because durability and verification are engineering properties of the system, not capabilities we are hoping the model has. The model drives the work in short, verified bursts, with human gates on the irreversible actions. That framing is the title of this blog. Durability is an engineering property, not a model capability. We did not make the model smarter. We built a system that lets a model of today do a week of careful work without falling apart.
+
+What’s Next
+
+If you want to build on this, I would start small and earn each layer. Get the git saved state and the single cycle loop working first, with the deterministic verifier as your gate, and prove to yourself that a crash mid run loses nothing. That durable single agent backbone is the hard, valuable core, and everything else is an addition that only earns its place where it provably helps. Add the reviewer when author bias starts costing you. Add the researchers when reading is your bottleneck. Add memory and self improvement when you are running the same kind of task again and again.
+
+The full code, including the Temporal workflows, the agent team, the memory tiers, and the offline evolution loop, is on GitHub:
+
+GitHub - FareedKhan-dev/long-running-agent: A step by step implementation to build an agent that…
+A step by step implementation to build an agent that runs for week to complete a task and self improve. …
+
+github.com
+
+Thank you for reading this far. We took one simple idea, assume interruption, and grew it into a system that can work on a real software task for a week, survive crashes and reboots, stay on budget, keep itself safe, and even learn from its own failures. The model did the thinking in short bursts. The engineering did the surviving.
+
+Wanna chat about long running agents or anything else? Reach me on my LinkedIn.
+
+AI
+Artificial Intelligence
+Data Science
+Machine Learning
+Python
+
+1K
+
+10
+
+7
+
+Published in Level Up Coding
+351K followers
+·
+Last published 3 hours ago
+
+Coding tutorials and news. The developer homepage gitconnected.com && skilled.dev && levelup.dev
+
+Follow
+Written by Fareed Khan
+76K followers
+·
+0 following
+
+I write on AI, https://www.linkedin.com/in/fareed-khan-dev/
+
+Follow
+
+Help
+
+Status
+
+About
+
+Careers
+
+Press
+
+Blog
+
+Store
+
+Privacy
+
+Rules
+
+Terms
+
+Text to speech
+
+To make Medium work, we log user data. By using Medium, you agree to our Privacy Policy, including cookie policy.", "result_type": "str

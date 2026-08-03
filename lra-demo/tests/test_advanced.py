@@ -23,6 +23,7 @@ def test_reviewer_flags_done_without_verification(tmp_path: Path) -> None:
 
 def test_reviewer_approves_verified_done(tmp_path: Path) -> None:
     anchor = MissionAnchor(tmp_path)
+    (tmp_path / "app.py").write_text("# app\n")
     anchor.write_checklist(
         {"items": [{"id": "1", "description": "Create app.py", "status": "done", "verified_by": ["pytest"]}]}
     )

@@ -2,7 +2,6 @@
 
 import subprocess
 from dataclasses import dataclass
-from typing import Callable
 
 
 @dataclass
@@ -44,6 +43,11 @@ class DeterministicVerifier:
             )
         return VerificationResult(checks=results)
 
+    @classmethod
+    def from_workdir(cls, workdir: str | None = None) -> "DeterministicVerifier":
+        """Build a verifier for a specific workdir using the default checks."""
+        return cls(build_default_checks())
+
 
 def build_default_checks() -> list[dict[str, str | int]]:
     return [
@@ -51,9 +55,3 @@ def build_default_checks() -> list[dict[str, str | int]]:
         {"name": "ruff", "command": "ruff check ."},
         {"name": "mypy", "command": "mypy src"},
     ]
-
-
-@classmethod
-def from_workdir(cls, workdir: str) -> "DeterministicVerifier":
-    """Build a verifier for a specific workdir using the default checks."""
-    return cls(build_default_checks())
