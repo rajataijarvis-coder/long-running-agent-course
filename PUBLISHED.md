@@ -1,10 +1,7 @@
-# Course Publication Status
+# Publication Tracker
 
-**Total chapters:** 30
-**Publication schedule:** Every 20 minutes, cron writes the next chapter from source + previous chapters.
-
-| # | Chapter | Status | Published At |
-|---|---------|--------|--------------|
+| Chapter | Title | Status | Published At |
+|---------|-------|--------|--------------|
 | 01 | The Problem with ChatGPT-style Agents | ✅ Published | 2026-08-03 |
 | 02 | Durability as an Engineering Property | 🔒 Locked | - |
 | 03 | Externalizing Truth — Git as Memory | 🔒 Locked | - |
@@ -35,6 +32,3 @@
 | 28 | Deployment and Blue/Green Workers | 🔒 Locked | - |
 | 29 | Observability with OpenTelemetry and Langfuse | 🔒 Locked | - |
 | 30 | Capstone — A Week-Long Mission End-to-End | 🔒 Locked | - |
-
-- 🔒 Locked = Not yet written/published
-- ✅ Published = Live on GitHub
