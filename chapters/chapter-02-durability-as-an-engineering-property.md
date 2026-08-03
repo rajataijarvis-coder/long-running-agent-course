@@ -5,266 +5,278 @@
 
 ## What We'll Cover
 
--   Defining durability in the context of autonomous agents.
--   The "Assume Interruption" mindset shift.
--   Volatile memory (context) vs. Durable storage (Git/DB).
--   Implementing checkpointing with `CycleOutcome`.
--   Wrapping agent logic in a Temporal workflow for crash recovery.
--   Hands-on: Building a crash-resume loop.
+- Why durability is a system property, not a model property
+- The "Assume Interruption" design rule
+- Volatile context vs. durable state
+- The anatomy of a checkpoint (`CycleOutcome`)
+- A runnable crash-resume loop you can kill and restart
+- How the durable spine (Temporal) turns a checkpoint into weeks-long execution
 
 ---
 
-## The Engineering Mindset
+## From Chat Loop to Durable Loop
 
-In Chapter 01, we identified the four failure modes that kill ChatGPT-style agents: process restarts, context window limits, API failures, and logical drift. The common thread across all four is **volatility**.
+In Chapter 01 we saw that a ChatGPT-style agent is basically one long conversation. If the process dies, the context window fills, or an API call flakes, the run is over. The model has no memory of *what it actually did* versus *what it only thought about doing*.
 
-Standard agents keep their state in RAM or the LLM's context window. If the process dies, the state vanishes. If the context fills up, the state is truncated. If the API fails, the state is inconsistent.
+Durability fixes this by making the **system** responsible for remembering. The model still thinks in short bursts, but every burst is:
 
-**Durability** means the system survives these events without losing progress. To achieve this, we must treat the LLM as a stateless function. It takes input (state + task), produces output (action), and then shuts up. It does not "remember" anything between calls. The *system* remembers.
+1. **Gathered** from durable state, not from a long chat history.
+2. **Executed** through journaled tool calls.
+3. **Verified** by deterministic checks.
+4. **Checkpointed** to durable storage before the next burst.
 
-This requires three engineering guarantees:
-1.  **Externalized State:** The source of truth lives on disk (Git) or in a database, not in RAM.
-2.  **Atomic Checkpoints:** Every action is recorded before the next one begins.
-3.  **Replayability:** If a crash occurs, the system can reload the last checkpoint and resume exactly where it left off.
+This is the "Assume Interruption" rule: design every cycle as if the process will be killed before the next one. If you can resume from disk, you can survive reboots, host migrations, API rate limits, and your own bugs.
 
-## The "Assume Interruption" Principle
+## Volatile vs. Durable
 
-In traditional software, we assume continuity. In long-running agent systems, we **assume interruption**.
+| Volatile (can die) | Durable (must survive) |
+|---|---|
+| Model context window | Git repo with the real code |
+| In-memory variables | Structured state files on disk |
+| Chat history | Decision log + attempt journal |
+| Process heap | Temporal event history |
 
-Every time the agent loop runs, it must act as if it is the first time it is running. It cannot rely on variables stored in memory from the previous iteration. It must reload its state from the durable store.
+The context window is a **lossy cache**. The real state lives outside it. In LRA that real state is a git repo plus a small set of saved-state files. When the system wakes up after a crash, it does not ask the model "what were we doing?" It re-reads the repo, the checklist, and the decision log.
 
-This sounds inefficient, but it is the only way to guarantee survival over days or weeks. A reboot on day 12 should reconstruct situational awareness in seconds by reading the log, not by hoping the process stayed alive.
+## The Checkpoint Contract
 
-## Code Walkthrough: The Checkpoint Cycle
-
-In the `lra` codebase, durability is enforced at the boundary of the `AgentLoop`. The loop produces a `CycleOutcome`, which describes exactly what happened. This outcome must be persisted before the loop runs again.
-
-Let's look at how we structure the data for durability. We use Pydantic models to ensure strict typing, which is critical when deserializing state after a crash.
-
-### Defining the Checkpoint
-
-First, we define what a checkpoint looks like. This lives in `src/lra/contracts/state.py`.
+The heart of the durable cycle is the checkpoint. In `src/lra/agent/loop.py` LRA defines `CycleOutcome` as the single source of truth for what happened in one cycle:
 
 ```python
-# src/lra/contracts/state.py
-from dataclasses import dataclass, field
-from typing import List, Optional
-from datetime import datetime
-
-@dataclass
-class Checkpoint:
-    """
-    A durable snapshot of the mission state.
-    This is written to disk/Git after every successful cycle.
-    """
-    mission_id: str
-    cycle_count: int
-    current_item_id: Optional[str]
-    completed_items: List[str] = field(default_factory=list)
-    head_sha: str  # The Git commit hash representing this state
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    cost_usd: float = 0.0
-    status: str = "RUNNING"  # RUNNING, BLOCKED, DONE, FAILED
-```
-
-### The Agent Loop Outcome
-
-The `AgentLoop` (from `src/lra/agent/loop.py`) returns a `CycleOutcome`. This is the transient result that must be converted into a permanent `Checkpoint`.
-
-```python
-# src/lra/agent/loop.py (excerpt)
+# From src/lra/agent/loop.py
 from dataclasses import dataclass
 
 @dataclass
 class CycleOutcome:
     """The result of one agent cycle."""
+
     item_id: str | None
-    advanced: bool          # Did we move to the next checklist item?
-    verified: bool          # Did the deterministic verifier pass?
-    is_complete: bool       # Is the whole mission done?
-    head_sha: str           # New Git commit hash
-    tool_calls: int         # Count for cost tracking
-    turns: int              # LLM turns taken
+    advanced: bool      # Did the item move forward at all?
+    verified: bool       # Did the deterministic verifier pass?
+    is_complete: bool    # Is the whole mission finished?
+    head_sha: str        # Git commit SHA that captured the work
+    tool_calls: int
+    turns: int
 ```
 
-### The Durable Workflow Wrapper
+Notice what is **not** in `CycleOutcome`: no chat history, no plan, no model reasoning. Those are inputs and side effects. The checkpoint only records *results* that can be re-read by a fresh process.
 
-In production, we wrap this loop in a Temporal Workflow. Temporal ensures that if the Python process crashes between `run_cycle` and `save_checkpoint`, the workflow replays from the last known good state.
-
-Here is a simplified version of the workflow logic found in `src/lra/durable/workflow.py`.
+The `AgentLoop` class in the same file is deliberately decoupled from Temporal. It is unit-testable on its own, and the durable spine calls it from inside an activity:
 
 ```python
-# src/lra/durable/workflow.py
-from temporalio import workflow
-from lra.contracts.state import Checkpoint
-from lra.agent.loop import AgentLoop, CycleOutcome
+# src/lra/agent/loop.py (excerpt)
+class AgentLoop:
+    """Runs one verified cycle of work using a model + tools + sandbox + verifier + anchor."""
 
-# Import activities (these are the actual Python functions)
-from .activities import run_agent_cycle_activity, save_checkpoint_activity
+    def __init__(
+        self,
+        *,
+        model: ModelProvider,
+        dispatcher: ToolDispatcher,
+        verifier: Verifier,
+        anchor: GitMissionAnchor,
+        ledger: CostLedger | None = None,
+        recorder: TraceRecorder | None = None,
+    ) -> None:
+        ...
+```
+
+A later chapter will unpack every part of that constructor. For now, the important idea is: the loop produces a `CycleOutcome`, and the durable spine decides what to do with it.
+
+## A Runnable Crash-Resume Loop
+
+Before we bring in Temporal, let's prove the idea with plain Python and a JSON checkpoint file. Save this as `lra-demo/ch02/durable_loop.py`:
+
+```python
+# lra-demo/ch02/durable_loop.py
+import json
+import os
+import random
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable
+
+CHECKPOINT_FILE = Path(".lra/ch02_checkpoint.json")
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    item_id: str
+    status: str          # "pending" | "done" | "blocked"
+    head_sha: str
+    attempts: int
+
+
+def load_checkpoint() -> Checkpoint | None:
+    if not CHECKPOINT_FILE.exists():
+        return None
+    data = json.loads(CHECKPOINT_FILE.read_text())
+    return Checkpoint(**data)
+
+
+def save_checkpoint(cp: Checkpoint) -> None:
+    CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_FILE.write_text(json.dumps(asdict(cp), indent=2))
+
+
+def verify(item_id: str) -> bool:
+    """Deterministic verification: a real artifact must exist and be marked done."""
+    artifact = Path(f"out/{item_id}.txt")
+    return artifact.exists() and "done" in artifact.read_text()
+
+
+def do_work(item_id: str) -> None:
+    """Simulate the agent writing code. Flaky on purpose."""
+    Path("out").mkdir(exist_ok=True)
+    print(f"[{item_id}] writing artifact...")
+    time.sleep(0.5)
+    # 30% chance of a crash mid-write
+    if random.random() < 0.3:
+        raise RuntimeError(f"simulated crash while working on {item_id}")
+    Path(f"out/{item_id}.txt").write_text(f"{item_id} done\n")
+
+
+def run_item(item_id: str) -> Checkpoint:
+    cp = load_checkpoint()
+    attempts = 1
+    if cp and cp.item_id == item_id:
+        attempts = cp.attempts + 1
+
+    status = "blocked"
+    try:
+        do_work(item_id)
+        status = "done" if verify(item_id) else "blocked"
+    except Exception as exc:
+        print(f"[{item_id}] crashed: {exc}")
+
+    # In the real system this would be `git rev-parse HEAD`
+    head_sha = "fake-sha-for-demo"
+    cp = Checkpoint(item_id=item_id, status=status, head_sha=head_sha, attempts=attempts)
+    save_checkpoint(cp)
+    return cp
+
+
+def main(items: list[str]) -> None:
+    for item in items:
+        cp = load_checkpoint()
+        if cp and cp.item_id == item and cp.status == "done":
+            print(f"[{item}] already done — skipping")
+            continue
+        print(f"[{item}] starting (previous attempts: {cp.attempts if cp else 0})")
+        cp = run_item(item)
+        print(f"[{item}] outcome: {cp}")
+    print("All items processed.")
+
+
+if __name__ == "__main__":
+    main(["parser", "server", "client"])
+```
+
+Run it, then kill it while it is working on `server`, then run it again:
+
+```bash
+cd lra-demo/ch02
+python durable_loop.py
+# while it is on "server", press Ctrl-C or `kill -9`
+python durable_loop.py
+```
+
+You will see it skip `parser` if it finished, resume `server` from the saved checkpoint, and not lose the attempt count. That is durability in its simplest form.
+
+## Wiring the Checkpoint into a Temporal Spine
+
+The standalone loop above proves the idea, but a real long-running mission needs a scheduler that can:
+
+- retry failed activities,
+- sleep for hours without holding a process,
+- replay exactly from the last successful activity,
+- resume on a different worker after a crash.
+
+LRA uses [Temporal](https://temporal.io) for this. The `AgentLoop` runs inside a Temporal activity, and the workflow orchestrator consumes the `CycleOutcome` it returns.
+
+Here is the minimal shape. The full version is in `src/lra/durable/workflows.py`:
+
+```python
+# lra-demo/ch02/minimal_temporal_spine.py
+from datetime import timedelta
+
+from temporalio import activity, workflow
+from temporalio.common import RetryPolicy
+
+
+# In the real system this is imported from src/lra.agent.loop
+class CycleOutcome:
+    def __init__(self, item_id: str, verified: bool, is_complete: bool, head_sha: str):
+        self.item_id = item_id
+        self.verified = verified
+        self.is_complete = is_complete
+        self.head_sha = head_sha
+
+
+@activity.defn
+async def agent_cycle_activity(item_id: str) -> dict:
+    """One durable unit of work. Temporal journals this call."""
+    # Build the real AgentLoop from config (omitted for brevity)
+    # loop = AgentLoop(model=..., dispatcher=..., verifier=..., anchor=...)
+    # outcome = await loop.run_cycle(item_id)
+
+    # Stubbed for this demo:
+    outcome = CycleOutcome(
+        item_id=item_id,
+        verified=True,
+        is_complete=item_id == "client",
+        head_sha="abc123",
+    )
+    return outcome.__dict__
+
 
 @workflow.defn
 class MissionWorkflow:
     @workflow.run
-    async def run(self, mission_id: str, task: str) -> Checkpoint:
-        # 1. Load existing state if replaying
-        state = await workflow.execute_activity(
-            load_state_activity,
-            mission_id,
-            start_to_close_timeout=timedelta(seconds=10)
-        )
+    async def run(self, task: str, checklist: list[str]) -> dict:
+        remaining = list(checklist)
+        while remaining:
+            item_id = remaining[0]
 
-        while not state.is_complete:
-            # 2. Run the agent cycle (LLM + Tools + Verify)
-            # Temporal guarantees this activity retries on failure
-            outcome: CycleOutcome = await workflow.execute_activity(
-                run_agent_cycle_activity,
-                mission_id,
-                state.current_item_id,
-                start_to_close_timeout=timedelta(minutes=30)
+            outcome = await workflow.execute_activity(
+                agent_cycle_activity,
+                item_id,
+                start_to_close_timeout=timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=3),
             )
 
-            # 3. Update State
-            state.cycle_count += 1
-            state.head_sha = outcome.head_sha
-            if outcome.advanced:
-                state.completed_items.append(outcome.item_id)
-            
-            # 4. Checkpoint to Git/Disk
-            # This is the durable anchor. If we crash after this, we resume fresh.
-            await workflow.execute_activity(
-                save_checkpoint_activity,
-                state,
-                start_to_close_timeout=timedelta(seconds=10)
-            )
+            if outcome["verified"]:
+                remaining.pop(0)
+            else:
+                # Blocked items stay at the front; a human or later cycle can unblock them.
+                await workflow.wait_condition(
+                    lambda: False, timeout=timedelta(seconds=5)
+                )
 
-            if outcome.is_complete:
-                state.status = "DONE"
-                break
-
-        return state
+        return {"status": "DONE", "head_sha": outcome["head_sha"]}
 ```
 
-**Why this matters:** Notice that `state` is passed into every activity. The workflow itself holds no mutable state in memory that isn't serialized. If the worker node dies at 3:00 AM, Temporal restarts the workflow on a new node, loads the last `Checkpoint`, and continues the `while` loop. No tokens are wasted re-doing previous steps.
+Key points:
 
-## Hands-on Exercise: Build a Crash-Resume Loop
+- The workflow never calls the model directly. It only schedules activities.
+- The activity is the smallest unit of durable work. If it crashes, Temporal retries it.
+- The workflow history records the *result* of each activity, so a restarted worker replays from the last outcome instead of re-running it.
+- Idle time is spent in durable sleep, costing zero tokens and zero compute.
 
-In this exercise, you will simulate the durability pattern without setting up Temporal yet. You will build a script that saves its progress to a JSON file, simulates a crash, and resumes without losing data.
+## Hands-On Exercise
 
-### Prerequisites
--   Python 3.12+
--   `pip install pydantic`
-
-### Step 1: Create the State Model
-
-Create a file named `durable_state.py`:
-
-```python
-from pydantic import BaseModel
-from typing import List
-from datetime import datetime
-
-class MissionState(BaseModel):
-    mission_id: str
-    step: int
-    history: List[str]
-    last_saved: str
-
-    def save(self, filename: str = "state.json"):
-        with open(filename, "w") as f:
-            f.write(self.model_dump_json(indent=2))
-        print(f"[CHECKPOINT] Saved step {self.step} to {filename}")
-
-    @classmethod
-    def load(cls, filename: str = "state.json") -> "MissionState":
-        try:
-            with open(filename, "r") as f:
-                return cls.model_validate_json(f.read())
-        except FileNotFoundError:
-            # Initial state if no checkpoint exists
-            return cls(
-                mission_id="demo-001",
-                step=0,
-                history=[],
-                last_saved=datetime.utcnow().isoformat()
-            )
-```
-
-### Step 2: Create the Durable Loop
-
-Create a file named `runner.py`:
-
-```python
-import time
-import os
-import sys
-from durable_state import MissionState
-
-def work_step(state: MissionState) -> MissionState:
-    """Simulates work being done."""
-    state.step += 1
-    state.history.append(f"Completed step {state.step}")
-    state.last_saved = time.time()
-    return state
-
-def main():
-    # 1. Load State (Assume Interruption)
-    print("--- Starting Agent ---")
-    state = MissionState.load()
-    print(f"Resumed at step {state.step}")
-
-    # 2. Work Loop
-    while state.step < 5:
-        # Simulate work
-        state = work_step(state)
-        print(f"Working... now at step {state.step}")
-
-        # 3. Checkpoint (Durability Boundary)
-        state.save()
-
-        # 4. Simulate Crash on Step 3
-        if state.step == 3:
-            print("! CRASH SIMULATED !")
-            # Delete the process memory (exit)
-            # In a real crash, the OS kills us here.
-            sys.exit(1)
-
-        time.sleep(1)
-
-    print("--- Mission Complete ---")
-
-if __name__ == "__main__":
-    main()
-```
-
-### Step 3: Run and Observe
-
-1.  Run the script: `python runner.py`
-2.  Observe it crash at step 3.
-3.  Run the script again: `python runner.py`
-4.  Observe it **resume** at step 3 and continue to 5 without re-doing steps 1 and 2.
-
-**Expected Output (Second Run):**
-```text
---- Starting Agent ---
-[CHECKPOINT] Loaded step 3 from state.json
-Resumed at step 3
-Working... now at step 4
-[CHECKPOINT] Saved step 4 to state.json
-Working... now at step 5
-[CHECKPOINT] Saved step 5 to state.json
---- Mission Complete ---
-```
-
-### Analysis
-If you had not saved the state to `state.json`, the second run would have started at step 0. By externalizing the state, you made the work durable. In the `lra` system, `state.json` is replaced by a Git commit, making the history immutable and auditable.
+1. Create `lra-demo/ch02/durable_loop.py` from the code above.
+2. Run it once and let it finish. Inspect `.lra/ch02_checkpoint.json`.
+3. Delete `out/server.txt` but keep the checkpoint. Run again. What happens? Why is the checkpoint not enough without the artifact?
+4. Modify `do_work` so it writes the artifact **before** the simulated crash, and the checkpoint **after** verification. Kill the process mid-run and confirm it resumes without redoing finished work.
+5. (Optional) If you have Docker running, start the Temporal dev server (`temporal server start-dev`) and run the minimal workflow spine. Watch the Temporal UI show each activity as a durable event.
 
 ## Key Takeaway
 
-> "The model thinks in short bursts, and the system runs for weeks by doing three boring things very well. It keeps the real state outside the model, it journals every step, and it verifies progress with real tests."
-> — Fareed Khan
-
-Durability is not about making the AI smarter. It is about building a container around the AI that survives failure. By externalizing state and checkpointing every cycle, you transform a fragile chat script into a robust engineering system.
+> Durability is an engineering property, not a model capability. The model thinks in short bursts; the system runs for weeks by keeping the real state outside the context window, journaling every step, and replaying from durable checkpoints.
 
 ## Next Chapter
 
-Now that we understand *why* state must be external, we need to decide *where* to put it. In Chapter 03, we will explore **Externalizing Truth — Git as Memory**. We will see why Git is the perfect database for agent state and how to structure commits so both humans and agents can read the history.
+In Chapter 03 we replace the JSON checkpoint with the real source of truth: a git repo. We will see how every commit becomes a checkpoint, how the mission anchor reads where things stand, and why "git as memory" makes a reboot on day 12 reconstruct situational awareness in seconds.
