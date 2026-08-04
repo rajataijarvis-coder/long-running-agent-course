@@ -30,5 +30,5 @@
 | 26 | Building an Eval Harness | ✅ Published | 2026-08-04 13:21 UTC |
 | 27 | Docker Compose Stack | ✅ Published | 2026-08-04 13:40 UTC |
 | 28 | Deployment and Blue/Green Workers | ✅ Published | 2026-08-04 14:01 UTC |
-| 29 | Observability with OpenTelemetry and Langfuse | 🔒 Locked | - |
+| 29 | Observability with OpenTelemetry and Langfuse | ✅ Published | 2026-08-04 14:21 UTC |
 | 30 | Capstone — A Week-Long Mission End-to-End | 🔒 Locked | - |
