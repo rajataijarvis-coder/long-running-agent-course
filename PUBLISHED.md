@@ -22,7 +22,7 @@
 | 18 | Vector Search and Skill Libraries | ✅ Published | 2026-08-04 10:41 UTC |
 | 19 | Re-embedding After Model Changes | ✅ Published | 2026-08-04 11:02 UTC |
 | 20 | Budget Governor and Cost Caps | ✅ Published | 2026-08-04 11:22 UTC |
-| 21 | Loop Detection and Escaping Oscillation | 🔒 Locked | - |
+| 21 | Loop Detection and Escaping Oscillation | ✅ Published | 2026-08-04 11:42 UTC |
 | 22 | HITL Gates and Irreversible Actions | 🔒 Locked | - |
 | 23 | Egress Policies and Default-Deny Security | 🔒 Locked | - |
 | 24 | Capturing Failure Traces | 🔒 Locked | - |
