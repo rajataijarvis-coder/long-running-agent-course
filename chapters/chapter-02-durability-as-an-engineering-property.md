@@ -14,41 +14,36 @@
 
 ---
 
-## Why Smarter Models Do Not Help
+## Why a Smarter Model Is Not Enough
 
-In Chapter 01 we saw that chat-style agents collapse because they keep the mission state inside the model's context window. A bigger model, a better prompt, or a cleverer chain-of-thought does not change that. If the process dies, the window is gone. If the API call fails, the loop stops. If the context overflows, the agent forgets what it was doing.
+In Chapter 01 we saw that the ChatGPT-style pattern is a single, in-memory loop. It works while the process is alive, the API is responsive, and the context window is empty. As soon as one of those conditions breaks, the run is over.
 
-Durability is not about reasoning quality. It is about whether the system can stop at any moment and resume correctly. That is an engineering property of the scaffolding around the model, not of the model itself.
+You cannot fix that by using a smarter model. A bigger context window only delays the loss. Better reasoning does not create a record on disk. Lower API latency does not survive a host reboot. Durability is a property of the *system*, not the *model*.
 
-This chapter makes that idea concrete. We will build a tiny but real crash-resume loop in plain Python, with no Temporal, no LLM, and no network. The goal is to prove the pattern: **the real state lives outside the process, and every cycle ends with a checkpoint.**
+The LRA design rule that follows is **Assume Interruption**. Every cycle, every activity, every write must be written as if the process could die in the next millisecond. The model is allowed to think in short bursts; the system is responsible for remembering what those bursts produced.
+
+This chapter makes that rule concrete with a small, runnable Python program that survives a `kill -9`. The same ideas are later promoted into Temporal workflows, but the core concept is local and testable first.
 
 ---
 
-## The "Assume Interruption" Design Rule
+## Volatile Context vs. Durable State
 
-The single most important rule in LRA is: **assume interruption.**
+The LLM context window is a **lossy cache**. It is fast to read, limited in size, and disappears when the process ends. Anything that must survive a restart belongs in **durable state** outside the window.
 
-Every design decision is asked the same question: "What happens if the process is killed right here?" If the answer is "we lose work," the design is wrong.
-
-This rule splits the world into two categories:
-
-| Volatile (can be rebuilt) | Durable (must survive) |
+| Volatile (context window) | Durable (disk / git / DB) |
 |---|---|
-| LLM context window | Checklist of remaining work |
-| In-memory variables | Decision log |
-| Model scratchpad | Git commits |
-| Tool output cache | Verification results |
-| Conversation history | Cost ledger |
+| Current plan being reasoned about | Checklist of items and statuses |
+| Tool output from the last minute | Event log of every attempt |
+| Model's internal chain-of-thought | Decision log with rationale |
+| Token budget scratchpad | Cost ledger with cumulative spend |
+| File contents being edited | The actual files in git |
 
-The context window is a **lossy cache**. The durable files are the **source of truth**. When the agent wakes up after a crash, it does not ask the model to remember where things stand. It re-reads the durable files.
-
-This is why `src/lra/agent/loop.py` ends every cycle with a `CycleOutcome` that is immediately written to git by the `GitMissionAnchor`. The model is allowed to think; the anchor is allowed to remember.
+The agent loop in `src/lra/agent/loop.py` encodes this split. It returns a `CycleOutcome` that contains only the durable facts:
 
 ```python
 @dataclass
 class CycleOutcome:
     """The result of one agent cycle."""
-
     item_id: str | None
     advanced: bool
     verified: bool
@@ -58,22 +53,44 @@ class CycleOutcome:
     turns: int
 ```
 
-Notice what is durable here. `head_sha` is a git commit hash. `item_id` points to a checklist entry on disk. `verified` is a boolean produced by a deterministic verifier, not by the model's confidence. None of these live in the LLM window.
+Notice what is *not* in `CycleOutcome`: the full conversation, the model's reasoning, or the raw tool output. Those are reconstructed from the durable anchor when the loop restarts. The durable record is intentionally small so it can be cheaply checkpointed every cycle.
 
 ---
 
-## A Crash-Resume Loop in Plain Python
+## The Anatomy of a Checkpoint
 
-To see the pattern without any framework, we will build `lra-demo/ch02_crash_resume.py`. It simulates an agent that must process a checklist of items. Each item requires one "work" step and one "verify" step. The process is killed at random moments. When it restarts, it re-reads its state file and continues exactly where it left off.
+A checkpoint in LRA has three responsibilities:
 
-Create the file `lra-demo/ch02_crash_resume.py`:
+1. **Capture progress** — which checklist item was worked on and whether it advanced.
+2. **Capture truth** — the git SHA of the repo after the work, so the state can be reproduced.
+3. **Capture cost** — how many turns and tool calls were spent, so the budget governor can decide whether to continue.
+
+The `CycleOutcome` fields map directly to these responsibilities:
+
+- `item_id` — the checklist item being worked on.
+- `advanced` — whether any forward progress happened this cycle.
+- `verified` — whether the deterministic verifier passed.
+- `is_complete` — whether the whole mission is finished.
+- `head_sha` — the git commit SHA that contains the real state.
+- `tool_calls` / `turns` — cost counters for the governor.
+
+This is the contract between the agent loop and the durable spine. The loop does not know whether it is running inside Temporal or a unit test; it only promises to return a `CycleOutcome` that can be journaled.
+
+---
+
+## A Runnable Crash-Resume Loop
+
+The file `lra-demo/ch02_crash_resume.py` demonstrates the idea without any external dependencies. It simulates an agent working through a checklist of three items. The process can be killed at any time and, when restarted, resumes exactly where it left off.
+
+Create `lra-demo/ch02_crash_resume.py` with the following code:
 
 ```python
+#!/usr/bin/env python3
 """lra-demo/ch02_crash_resume.py
 
-A minimal crash-resume loop that demonstrates durability as an engineering property.
-No LLM, no Temporal, no network. Just a state file, a checkpoint function, and a loop
-that assumes it can be killed at any moment.
+A self-contained crash-resume agent loop. Run it, then press Ctrl-C or
+send SIGKILL while it is "working". Run it again and it resumes from the
+last durable checkpoint instead of starting over.
 """
 
 from __future__ import annotations
@@ -82,203 +99,170 @@ import json
 import random
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-STATE_PATH = Path(".lra-demo/ch02_state.json")
+CHECKPOINT_PATH = Path(".lra-demo/ch02_checkpoint.json")
 
 
 @dataclass
-class Item:
-    id: str
-    description: str
-    done: bool = False
+class Checkpoint:
+    item_index: int = 0
     attempts: int = 0
+    verified_count: int = 0
+    total_turns: int = 0
 
 
-@dataclass
-class MissionState:
-    mission_id: str
-    items: list[Item]
-    cycle_count: int = 0
-    last_action: str | None = None
-    crashed_at: str | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "mission_id": self.mission_id,
-            "items": [asdict(item) for item in self.items],
-            "cycle_count": self.cycle_count,
-            "last_action": self.last_action,
-            "crashed_at": self.crashed_at,
-        }
-
-    @classmethod
-    def from_dict(cls, raw: dict) -> MissionState:
-        return cls(
-            mission_id=raw["mission_id"],
-            items=[Item(**item) for item in raw["items"]],
-            cycle_count=raw.get("cycle_count", 0),
-            last_action=raw.get("last_action"),
-            crashed_at=raw.get("crashed_at"),
-        )
+def load_checkpoint() -> Checkpoint:
+    if CHECKPOINT_PATH.exists():
+        with CHECKPOINT_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"[resume] loaded checkpoint: {data}")
+        return Checkpoint(**data)
+    return Checkpoint()
 
 
-def load_state() -> MissionState:
-    if not STATE_PATH.exists():
-        initial = MissionState(
-            mission_id="demo-mission-001",
-            items=[
-                Item(id="item-1", description="Create project scaffold"),
-                Item(id="item-2", description="Add hello.py"),
-                Item(id="item-3", description="Add a test for hello.py"),
-                Item(id="item-4", description="Run the test and verify it passes"),
-            ],
-        )
-        save_state(initial)
-        return initial
-    with STATE_PATH.open() as f:
-        return MissionState.from_dict(json.load(f))
+def save_checkpoint(cp: Checkpoint) -> None:
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with CHECKPOINT_PATH.open("w", encoding="utf-8") as f:
+        json.dump(asdict(cp), f, indent=2)
+    print(f"[checkpoint] saved: {asdict(cp)}")
 
 
-def save_state(state: MissionState) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with STATE_PATH.open("w") as f:
-        json.dump(state.to_dict(), f, indent=2)
+ITEMS = [
+    "Create hello.py that prints 'hello'",
+    "Add a pytest test for hello.py",
+    "Run the test and verify it passes",
+]
 
 
-def do_work(item: Item) -> None:
-    """Simulate the model+tools doing work. Idempotent: safe to retry."""
-    item.attempts += 1
-    item.last_action = f"work_attempt_{item.attempts}"
-    print(f"  → working on {item.id} (attempt {item.attempts})")
-    time.sleep(0.2)
+def do_work(cp: Checkpoint) -> bool:
+    """Simulate one cycle of work on the current item.
 
+    Returns True when the whole mission is complete.
+    """
+    if cp.item_index >= len(ITEMS):
+        return True
 
-def verify(item: Item) -> bool:
-    """Deterministic verifier. In a real system this runs tests/lint/build."""
-    # Deterministic per item: item-1 and item-3 pass, item-2 needs two attempts, item-4 passes.
-    if item.id == "item-2":
-        return item.attempts >= 2
-    return True
+    item = ITEMS[cp.item_index]
+    cp.attempts += 1
+    cp.total_turns += 1
 
+    print(f"[work] item {cp.item_index}: {item} (attempt {cp.attempts}, turn {cp.total_turns})")
 
-def maybe_crash(state: MissionState) -> None:
-    """Simulate a host reboot or killed process."""
-    if random.random() < 0.35:
-        state.crashed_at = f"cycle_{state.cycle_count}"
-        save_state(state)
-        print(f"💥 CRASH at {state.crashed_at}!")
-        sys.exit(1)
+    # Simulate variable work duration and occasional failure.
+    time.sleep(1.5)
+    success = random.random() > 0.25
 
-
-def run_cycle(state: MissionState) -> bool:
-    """One durable cycle: pick next item, work, verify, checkpoint."""
-    state.cycle_count += 1
-    pending = [item for item in state.items if not item.done]
-
-    if not pending:
-        return False  # mission complete
-
-    item = pending[0]
-    state.last_action = f"start_{item.id}"
-    save_state(state)
-
-    do_work(item)
-
-    state.last_action = f"verify_{item.id}"
-    save_state(state)
-
-    if verify(item):
-        item.done = True
-        state.last_action = f"done_{item.id}"
-        print(f"  ✅ {item.id} verified and marked done")
+    if success:
+        print(f"[work] item {cp.item_index} verified")
+        cp.verified_count += 1
+        cp.item_index += 1
+        cp.attempts = 0
     else:
-        state.last_action = f"blocked_{item.id}"
-        print(f"  ⛔ {item.id} blocked, will retry later")
+        print(f"[work] item {cp.item_index} not yet verified, will retry")
 
-    save_state(state)
-    return True
+    save_checkpoint(cp)
+    return cp.item_index >= len(ITEMS)
 
 
-def main() -> None:
-    print("=" * 50)
-    print("LRA Chapter 02 — Crash-Resume Demo")
-    print("=" * 50)
+def main() -> int:
+    cp = load_checkpoint()
 
-    state = load_state()
-    print(f"Loaded state: cycle={state.cycle_count}, "
-          f"done={sum(1 for i in state.items if i.done)}/{len(state.items)}, "
-          f"crashed_at={state.crashed_at}")
+    print(f"[start] mission state: {asdict(cp)}")
+    complete = False
 
-    while run_cycle(state):
-        maybe_crash(state)
+    try:
+        while not complete:
+            complete = do_work(cp)
+    except KeyboardInterrupt:
+        print("\n[interrupt] caught KeyboardInterrupt — state is already on disk")
+        return 130
 
-    print("\n🎉 Mission complete!")
-    print(f"Total cycles: {state.cycle_count}")
-    for item in state.items:
-        print(f"  {item.id}: done={item.done}, attempts={item.attempts}")
+    print(f"[done] mission complete after {cp.total_turns} turns")
+    CHECKPOINT_PATH.unlink(missing_ok=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
 
-### What the demo proves
+### Walkthrough
 
-1. **State is durable.** `MissionState` is written to `.lra-demo/ch02_state.json` before and after every meaningful action. If the process dies, the file tells the truth.
-2. **Work is idempotent.** `do_work` increments `attempts` and can be retried safely. In the real system, tool calls are idempotent or journaled.
-3. **Verification is deterministic.** `verify(item)` does not ask the model if the item looks done. It checks a concrete condition. Item `item-2` is deliberately designed to need two attempts, so you can watch the system retry without panicking.
-4. **Resume is reconstruction, not recall.** When the script restarts, `load_state()` rebuilds situational awareness from the file. The model (here, just a function) does not need to remember anything.
+1. **`Checkpoint`** keeps only the durable facts: which item is active, how many attempts have been made, how many items are verified, and the total turn count.
+2. **`load_checkpoint`** reads the JSON file if it exists. On first run there is no file, so it starts from zero.
+3. **`do_work`** simulates one cycle. It increments counters, sleeps to represent real work, and randomly succeeds or fails.
+4. **`save_checkpoint`** is called **inside** the cycle, before the loop decides what to do next. That is the critical placement: if the process dies after the work but before the save, the cycle is replayed; if it dies after the save, the next run resumes from the saved state.
+5. **`main`** catches `KeyboardInterrupt` so a `Ctrl-C` does not corrupt the checkpoint. The state is already on disk, so the process can exit cleanly.
 
-Run it several times in a row. It will crash at random cycles, but each restart picks up exactly where it left off:
+### Run It
 
 ```bash
-uv run python lra-demo/ch02_crash_resume.py
-# 💥 CRASH at cycle_2!
-uv run python lra-demo/ch02_crash_resume.py
-# Loaded state: cycle=2, done=0/4, crashed_at=cycle_2
-# ...
+cd lra-demo
+python ch02_crash_resume.py
 ```
 
-When it finally completes, inspect the state file:
+Let it run for a few seconds, then press `Ctrl-C`. You will see output like:
+
+```
+[resume] loaded checkpoint: {'item_index': 0, 'attempts': 0, 'verified_count': 0, 'total_turns': 0}
+[start] mission state: {'item_index': 0, 'attempts': 0, 'verified_count': 0, 'total_turns': 0}
+[work] item 0: Create hello.py that prints 'hello' (attempt 1, turn 1)
+^C
+[interrupt] caught KeyboardInterrupt — state is already on disk
+```
+
+Now run it again:
 
 ```bash
-cat .lra-demo/ch02_state.json
+python ch02_crash_resume.py
 ```
 
-You will see a complete audit trail: every cycle, every attempt, every crash.
+It resumes from the saved `item_index`, not from the beginning. After enough successful cycles it deletes the checkpoint and prints:
+
+```
+[done] mission complete after N turns
+```
+
+This is the local version of the durable spine. The real LRA system does the same thing, but the checkpoint is a Temporal event and the state is a git commit.
 
 ---
 
-## From Local Checkpoint to Temporal Spine
+## From Local Checkpoint to Temporal Durable Spine
 
-The demo above is local. In later chapters we will replace the JSON file with git commits and the random crash with a real host reboot. Then we will wrap the same cycle inside a Temporal workflow.
+The demo above is intentionally simple. In the full LRA package, the same responsibilities are handled by three layers:
 
-The pattern does not change. The durable spine only makes it stronger:
+1. **`GitMissionAnchor`** (`src/lra/state/mission_anchor.py`) — writes the real state to git after every verified cycle.
+2. **`AgentLoop`** (`src/lra/agent/loop.py`) — produces a `CycleOutcome` that the anchor turns into a commit.
+3. **`MissionWorkflow`** (`src/lra/durable/`) — runs the loop inside a Temporal workflow so that process crashes resume automatically.
 
-- **Activities** journal every LLM call and tool call, with automatic retries.
-- **Replay-from-cache** means a resumed workflow does not re-spend tokens on calls that already succeeded.
-- **Durable sleep** lets the agent wait for hours or days at zero cost.
-- **Continue-as-new** prevents the workflow history from growing forever.
+The progression is:
 
-But the mental model is the same: assume interruption, checkpoint after every cycle, and re-read the truth on wake-up.
+- **This chapter:** durable checkpoint in a plain Python file.
+- **Chapter 04:** the same cycle wrapped in git commits.
+- **Chapter 12:** the same cycle wrapped in Temporal workflows.
+
+The design does not change; only the durability mechanism gets stronger.
 
 ---
 
 ## Hands-On Exercise
 
-1. **Run the crash-resume demo** until it completes without crashing. Observe that `item-2` requires two attempts and the system retries it naturally.
-2. **Introduce a bug** in `verify()` that makes it always return `False` for one item. Run the demo and confirm the system keeps retrying forever. This is the "blocked" state from `CycleOutcome`.
-3. **Add a `max_attempts` field** to `Item` and modify the loop to skip an item after three failed attempts. Checkpoint the skip decision so the agent does not retry it on resume.
-4. **Replace the JSON state file with a git commit** after every `save_state()`. Use `git -C .lra-demo log --oneline` to inspect the history. This previews Chapter 03.
+1. Run `lra-demo/ch02_crash_resume.py` to completion once and note the total turn count.
+2. Run it again and kill the process with `Ctrl-C` after one or two items complete. Verify that `.lra-demo/ch02_checkpoint.json` exists and contains the correct `item_index`.
+3. Restart the script and confirm it resumes from the saved index, not from item 0.
+4. Open the checkpoint file, manually set `attempts` to `10`, save it, and restart the script. Observe how the loop behaves when it reads a tampered checkpoint. (This is why the real system signs or commits checkpoints.)
+5. Modify `do_work` to write a real file (for example, create `hello.py`) instead of just sleeping. Make the checkpoint include a SHA or file hash so the resume can detect whether the last cycle's work actually landed on disk.
 
 ---
 
-> **Key Takeaway:** A durable agent does not rely on the model to remember. It writes the truth to disk after every cycle, assumes it will be interrupted, and reconstructs situational awareness by reading that truth on wake-up. The model thinks; the system remembers.
+## Key Takeaway
+
+> Durability is not a side effect of good prompting; it is an engineering property built into every write. Assume interruption, keep the real state outside the model, and checkpoint after every verified cycle.
 
 ---
 
 ## Next Chapter
 
-In **Chapter 03: Externalizing Truth — Git as Memory**, we replace the JSON state file with a real git repository. We will see why git is the perfect durable memory for an agent: commits are checkpoints, diffs are decision logs, and `HEAD` is the single source of truth.
+In Chapter 03 we externalize the source of truth completely. We replace the JSON checkpoint with a git repository and use commits as the durable memory of the mission.
