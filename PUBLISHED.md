@@ -3,7 +3,7 @@
 | Chapter | Title | Status | Published At |
 |---------|-------|--------|--------------|
 | 01 | The Problem with ChatGPT-style Agents | ✅ Published | 2026-08-03 |
-| 02 | Durability as an Engineering Property | 🔒 Locked | - |
+| 02 | Durability as an Engineering Property | ✅ Published | 2026-08-04 |
 | 03 | Externalizing Truth — Git as Memory | 🔒 Locked | - |
 | 04 | The Gather → Act → Verify → Checkpoint Cycle | 🔒 Locked | - |
 | 05 | Tool Dispatching and Sandboxing | 🔒 Locked | - |
