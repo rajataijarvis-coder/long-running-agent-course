@@ -24,7 +24,7 @@
 | 20 | Budget Governor and Cost Caps | ✅ Published | 2026-08-04 11:22 UTC |
 | 21 | Loop Detection and Escaping Oscillation | ✅ Published | 2026-08-04 11:42 UTC |
 | 22 | HITL Gates and Irreversible Actions | ✅ Published | 2026-08-04 12:02 UTC |
-| 23 | Egress Policies and Default-Deny Security | 🔒 Locked | - |
+| 23 | Egress Policies and Default-Deny Security | ✅ Published | 2026-08-04 12:22 UTC |
 | 24 | Capturing Failure Traces | 🔒 Locked | - |
 | 25 | Offline Evolution — Propose, Evaluate, Promote | 🔒 Locked | - |
 | 26 | Building an Eval Harness | 🔒 Locked | - |
