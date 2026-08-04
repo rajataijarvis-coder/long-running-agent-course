@@ -16,7 +16,7 @@
 | 12 | Temporal Workflows for Long-Running Agents | ✅ Published | 2026-08-04 08:41 UTC |
 | 13 | Activities, Retries, and Replay-from-Cache | ✅ Published | 2026-08-04 09:02 UTC |
 | 14 | Durable Sleep and Continue-As-New | ✅ Published | 2026-08-04 09:22 UTC |
-| 15 | Surviving Crashes — Kill and Resume | 🔒 Locked | - |
+| 15 | Surviving Crashes — Kill and Resume | ✅ Published | 2026-08-04 09:43 UTC |
 | 16 | The Mission Anchor | 🔒 Locked | - |
 | 17 | Tiered Memory | 🔒 Locked | - |
 | 18 | Vector Search and Skill Libraries | 🔒 Locked | - |
