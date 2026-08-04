@@ -11,7 +11,7 @@
 | 07 | Building Your First Local Mission | ✅ Published | 2026-08-04 07:02 UTC |
 | 08 | Asymmetric Multi-Agent Design | ✅ Published | 2026-08-04 07:21 UTC |
 | 09 | Research Fan-out (Parallel Reading) | ✅ Published | 2026-08-04 07:41 UTC |
-| 10 | The Lead Engineer (Single Writer) | 🔒 Locked | - |
+| 10 | The Lead Engineer (Single Writer) | ✅ Published | 2026-08-04 08:01 UTC |
 | 11 | Reviewer and Reflection Agents | 🔒 Locked | - |
 | 12 | Temporal Workflows for Long-Running Agents | 🔒 Locked | - |
 | 13 | Activities, Retries, and Replay-from-Cache | 🔒 Locked | - |
