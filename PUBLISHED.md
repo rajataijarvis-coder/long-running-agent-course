@@ -8,7 +8,7 @@
 | 04 | The Gather → Act → Verify → Checkpoint Cycle | ✅ Published | 2026-08-04 06:01 UTC |
 | 05 | Tool Dispatching and Sandboxing | ✅ Published | 2026-08-04 06:20 UTC |
 | 06 | Deterministic Verification — Exit Codes as Ground Truth | ✅ Published | 2026-08-04 06:40 UTC |
-| 07 | Building Your First Local Mission | 🔒 Locked | - |
+| 07 | Building Your First Local Mission | ✅ Published | 2026-08-04 07:02 UTC |
 | 08 | Asymmetric Multi-Agent Design | 🔒 Locked | - |
 | 09 | Research Fan-out (Parallel Reading) | 🔒 Locked | - |
 | 10 | The Lead Engineer (Single Writer) | 🔒 Locked | - |
