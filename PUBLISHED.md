@@ -27,7 +27,7 @@
 | 23 | Egress Policies and Default-Deny Security | ✅ Published | 2026-08-04 12:22 UTC |
 | 24 | Capturing Failure Traces | ✅ Published | 2026-08-04 12:42 UTC |
 | 25 | Offline Evolution — Propose, Evaluate, Promote | ✅ Published | 2026-08-04 13:02 UTC |
-| 26 | Building an Eval Harness | 🔒 Locked | - |
+| 26 | Building an Eval Harness | ✅ Published | 2026-08-04 13:21 UTC |
 | 27 | Docker Compose Stack | 🔒 Locked | - |
 | 28 | Deployment and Blue/Green Workers | 🔒 Locked | - |
 | 29 | Observability with OpenTelemetry and Langfuse | 🔒 Locked | - |
