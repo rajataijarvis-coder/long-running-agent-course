@@ -13,7 +13,7 @@
 | 09 | Research Fan-out (Parallel Reading) | ✅ Published | 2026-08-04 07:41 UTC |
 | 10 | The Lead Engineer (Single Writer) | ✅ Published | 2026-08-04 08:01 UTC |
 | 11 | Reviewer and Reflection Agents | ✅ Published | 2026-08-04 08:21 UTC |
-| 12 | Temporal Workflows for Long-Running Agents | 🔒 Locked | - |
+| 12 | Temporal Workflows for Long-Running Agents | ✅ Published | 2026-08-04 08:41 UTC |
 | 13 | Activities, Retries, and Replay-from-Cache | 🔒 Locked | - |
 | 14 | Durable Sleep and Continue-As-New | 🔒 Locked | - |
 | 15 | Surviving Crashes — Kill and Resume | 🔒 Locked | - |
