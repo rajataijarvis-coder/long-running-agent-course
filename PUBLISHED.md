@@ -18,7 +18,7 @@
 | 14 | Durable Sleep and Continue-As-New | ✅ Published | 2026-08-04 09:22 UTC |
 | 15 | Surviving Crashes — Kill and Resume | ✅ Published | 2026-08-04 09:43 UTC |
 | 16 | The Mission Anchor | ✅ Published | 2026-08-04 10:02 UTC |
-| 17 | Tiered Memory | 🔒 Locked | - |
+| 17 | Tiered Memory | ✅ Published | 2026-08-04 10:22 UTC |
 | 18 | Vector Search and Skill Libraries | 🔒 Locked | - |
 | 19 | Re-embedding After Model Changes | 🔒 Locked | - |
 | 20 | Budget Governor and Cost Caps | 🔒 Locked | - |
